@@ -279,13 +279,11 @@ scrape_configs:
 | NAS 切换 | 源换为 tag v1.2.0 → 本地构建 `homeeye-nas:1.2.0`（`HE_WITH_MILOCO_SDK=1`）→ `docker compose up -d homeeye`；容器 6 秒到 `healthy` |
 | 切换后自检 | `/api/health` → `version 1.2.0`，两路摄像头 `ok`；生产 `/api/metrics` 23/23 全过；扫描器心跳 0.19 s |
 | 回滚路径 | NAS 上 `/tmp/homeeye-src-1.1.4.tgz` + 同目录 `src.old`；`homeeye-nas:1.1.4` 镜像仍在，compose 的 image 改回 1.1.4 再 `up -d` 即回滚 |
+| Release 附件回读 | 在 NAS 上 `curl` 下载附件（本机直连被网络拦，NAS 重试后成功）：5,774,114 B、md5 `37e71d2a…`，与本地出包一致 |
 
 ### 没验证的（别照着这些吹）
 
-- **1.2.0 Release 附件下载**：上传走 API 成功（5,774,114 B 已回显），但本机到
-  `objects.githubusercontent.com` 的直连被网络拦（curl 空回复），NAS 侧那次下载也
-  超时，所以没做成"下载回来对 md5"。附件大小由 API 回显确认，内容即本仓库 `tools/pack-fpk.sh`
-  的产物。
+
 
 - **公开镜像整镜像二次拉取（1.1.4）**：NAS 上匿名 `docker pull` 这次卡在到 ghcr.io 的
   IPv6 路由上（层显示下载完、连接随后无进展，15 分钟放弃），所以没做"拉下来起临时容器"。
