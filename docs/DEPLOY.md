@@ -206,12 +206,27 @@ cd docker && docker compose pull && docker compose up -d   # 换新镜像，data
 | GHCR 镜像能跑 | 用拉下来的镜像起临时容器（`-p 127.0.0.1:18077:8088`，`/tmp` 数据卷） | 8 秒 `healthy`；`/api/health` → `{"ok":true,"version":"1.1.3"}`；未认领时 `/api/state` → 401 |
 | GHCR 云台版 go2rtc | Actions 日志里脚本第 5 步的冒烟输出 | `/api/xiaomi/ptz` 有返回、`/api/xiaomi/motor` 不是 404 —— 补丁确实在镜像里 |
 
+**1.1.4（云台修复 + 运行环境自检）同一套复核，结果如下：**
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| fpk 出包 | `FNPACK=…/fnpack.exe sh tools/pack-fpk.sh`（发布树根） | 成功；5,751,700 B；`checksum = 57870f91e1b6fbb75725933fef50c2a4`；`app.tgz` 里有 `server/nw_env.py` |
+| fpk 匿名下载 | Release 附件 Range 请求 | 206，`Content-Range: 0-1023/5751700` |
+| GHCR 匿名 manifest | 不带凭据请求 `homeeye:1.1.4` 的 manifest（`Docker-Content-Digest`） | 200；digest `sha256:59d47b19828c…`；云台版 `homeeye-go2rtc-ptz:1.9.15` digest `sha256:0124d7df6ee0…` |
+| GHCR 启动冒烟 | Actions 工作流里的冒烟步骤（起容器后 `curl /api/health`） | 200 才允许推送；run 41035881751 两个 job 全绿 |
+| 云台修复真机验证（NAS，1.1.4） | 帧相关 + `/api/xiaomi/motor` | 点右画面右移 36 px、点左左移 36 px；上/下仰角 27↔39；按住 2 秒松手后停在原地（租约自停）；接口 0.4–0.9 ms |
+| 运行环境自检 | 容器日志 + 登录后 `/api/health` | 日志 `[env] install=docker python=3.12.16 ffmpeg=7.1.5` / `xiaomi=ok`；`health.env.warnings` 为空 |
+
 镜像由仓库的 `.github/workflows/ghcr.yml` 手动触发构建（`permissions: packages: write`，
 用仓库自带 `GITHUB_TOKEN`，不需要任何个人令牌）。本体按 HomeEye 版本打 tag，
 云台版 go2rtc 按上游版本打 tag（`1.9.15`）。
 
 ### 没验证的（别照着这些吹）
 
+- **公开镜像整镜像二次拉取（1.1.4）**：NAS 上匿名 `docker pull` 这次卡在到 ghcr.io 的
+  IPv6 路由上（层显示下载完、连接随后无进展，15 分钟放弃），所以没做"拉下来起临时容器"。
+  1.1.4 以 **Actions 冒烟（起容器 `/api/health` 200）+ 匿名 manifest 200** 为准；
+  1.1.3 那次在 IPv4 上整拉成功（3 分 36 秒）。网络好的环境拉 1.1.4 应无差别。
 - **小米那一路**：这次构建 `HE_WITH_MILOCO_SDK=0`，SDK 没装，`app/sdk/` 只有一个占位
   README。容器日志里的 `ptz disabled: 未配置...` 就是这条路径缺依赖时的正常降级，
   **不代表小米功能可用**。要走小米得自己跑 `sh tools/fetch-miloco-sdk.sh`，再
