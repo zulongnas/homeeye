@@ -1,0 +1,102 @@
+# HomeEye · 把预构建镜像推到 GHCR
+#
+# 为什么用 Actions 而不是本机 push：往 ghcr.io 推镜像需要 write:packages 权限，
+# 而本机 git 用的 OAuth 令牌只有 gist/repo/workflow —— 登录能成功，推送会被拒
+# （denied: permission_denied: The token provided does not match expected scopes）。
+# 仓库自带的 GITHUB_TOKEN 带上 packages: write 就能推，不需要任何额外令牌。
+#
+# 手动触发一次，产出两个镜像：
+#   ghcr.io/<owner>/homeeye:<version>            本体（HE_WITH_MILOCO_SDK=0，不夹带小米 SDK）
+#   ghcr.io/<owner>/homeeye-go2rtc-ptz:<version> 打了云台/对讲补丁的 go2rtc
+#
+# 镜像默认是 private。要让别人直接 docker pull，去
+# GitHub → 个人头像 → Your packages → 对应 package → Package settings → Change visibility
+# 改成 Public（这是网页开关，API 也需要 write:packages，和推送是同一个坎）。
+name: 构建并推送 GHCR 镜像
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 镜像版本标签（与 Release 一致，如 1.1.3）
+        required: true
+        default: "1.1.3"
+      go2rtc_version:
+        description: go2rtc 上游版本（要带 v）
+        required: true
+        default: "v1.9.15"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+  G2R_IMAGE: ghcr.io/${{ github.repository }}-go2rtc-ptz
+
+jobs:
+  homeeye:
+    name: homeeye 本体
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 登录 GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      # 不传 HE_WITH_MILOCO_SDK=1：小米 SDK 许可不允许再分发，公开镜像里只能没有它。
+      - name: 构建
+        run: |
+          docker build -f docker/Dockerfile \
+            -t "$IMAGE:${{ inputs.version }}" \
+            -t "$IMAGE:latest" \
+            .
+
+      # 推之前先证明这镜像起得来：零配置首启 + /api/health 200（无摄像头时 healthy）。
+      - name: 冒烟
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/he-data"
+          docker run -d --name he-smoke -p 127.0.0.1:18099:8088 \
+            -v "$RUNNER_TEMP/he-data:/data" "$IMAGE:${{ inputs.version }}"
+          code=000
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 \
+                   http://127.0.0.1:18099/api/health || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          docker logs --tail 30 he-smoke || true
+          docker rm -f he-smoke >/dev/null 2>&1 || true
+          if [ "$code" != "200" ]; then
+            echo "FAIL: /api/health 返回 $code（期望 200）"
+            exit 1
+          fi
+          echo "OK: 镜像可起，/api/health = 200"
+
+      - name: 推送
+        run: docker push --all-tags "$IMAGE"
+
+  go2rtc:
+    name: go2rtc（云台补丁版）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 登录 GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      # 脚本自己会做四件事：校验上游 tarball 的 sha256、打补丁、容器内编译、
+      # 起临时容器验 /api/xiaomi/ptz 存在。补丁没打上会当场退出。
+      - name: 取上游 + 打补丁 + 编译 + 冒烟 + 出镜像
+        env:
+          VER: ${{ inputs.go2rtc_version }}
+          TAG: ghcr.io/${{ github.repository }}-go2rtc-ptz:${{ inputs.version }}
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          set -eu
+          sh tools/build-go2rtc-ptz.sh
+          docker tag "$TAG" "$G2R_IMAGE:latest"
+          docker push "$TAG"
+          docker push "$G2R_IMAGE:latest"
