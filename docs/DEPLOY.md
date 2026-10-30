@@ -268,7 +268,24 @@ scrape_configs:
 1.2.0-A（按 IDR 起播修绿带）与 1.2.0-B（双码流）在开发阶段已在真机主/子码流上
 验证过；本次回归没有再采样画面，只确认这两块的代码路径没被后续改动碰到。
 
+**1.2.0 发版与上线（2026-10-31）：**
+
+| 项 | 结果 |
+|---|---|
+| 分支 | `main` @ `c04b845`（20 文件，+2102/−214） |
+| tag / Release | `v1.2.0`；Release 附件 `homeeye.fpk` 5,774,114 B，md5 `37e71d2a052f539a144c1b83b95be4e5` |
+| GHCR 构建 | run `41132909101`（`workflow_dispatch`，version=1.2.0、go2rtc=v1.9.15）；`homeeye 本体` 与 `go2rtc（云台补丁版）` 两个 job 全绿 |
+| GHCR 匿名 manifest | `homeeye:1.2.0` → `sha256:d1b4f7d3…`；`homeeye-go2rtc-ptz:1.9.15` → `sha256:a91bb0c2…`（不带凭据可取，镜像公开） |
+| NAS 切换 | 源换为 tag v1.2.0 → 本地构建 `homeeye-nas:1.2.0`（`HE_WITH_MILOCO_SDK=1`）→ `docker compose up -d homeeye`；容器 6 秒到 `healthy` |
+| 切换后自检 | `/api/health` → `version 1.2.0`，两路摄像头 `ok`；生产 `/api/metrics` 23/23 全过；扫描器心跳 0.19 s |
+| 回滚路径 | NAS 上 `/tmp/homeeye-src-1.1.4.tgz` + 同目录 `src.old`；`homeeye-nas:1.1.4` 镜像仍在，compose 的 image 改回 1.1.4 再 `up -d` 即回滚 |
+
 ### 没验证的（别照着这些吹）
+
+- **1.2.0 Release 附件下载**：上传走 API 成功（5,774,114 B 已回显），但本机到
+  `objects.githubusercontent.com` 的直连被网络拦（curl 空回复），NAS 侧那次下载也
+  超时，所以没做成"下载回来对 md5"。附件大小由 API 回显确认，内容即本仓库 `tools/pack-fpk.sh`
+  的产物。
 
 - **公开镜像整镜像二次拉取（1.1.4）**：NAS 上匿名 `docker pull` 这次卡在到 ghcr.io 的
   IPv6 路由上（层显示下载完、连接随后无进展，15 分钟放弃），所以没做"拉下来起临时容器"。
