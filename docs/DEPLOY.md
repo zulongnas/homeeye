@@ -22,7 +22,7 @@ curl -s http://127.0.0.1:8088/api/health | head -c 300
 
 | 镜像 | 是什么 | 备注 |
 |---|---|---|
-| `ghcr.io/zulongnas/homeeye:1.2.0` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
+| `ghcr.io/zulongnas/homeeye:1.2.1` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
 | `ghcr.io/zulongnas/homeeye-go2rtc-ptz:1.9.15` | go2rtc 官方 `master-hardware` + 云台/对讲补丁 | tag 是 go2rtc 的上游版本（它只在换上游时变）；换回 `alexxit/go2rtc:master-hardware` 也能拉流硬转 |
 
 要改代码、要小米 SDK、或者不想用别人构建的镜像，就用本地构建（镜像名不变，
@@ -181,7 +181,7 @@ cd docker && docker compose pull && docker compose up -d   # 换新镜像，data
 `always/never`（升级不改行为）。回滚 = 换回旧 tag 的镜像再起一次；
 `data/` 不需要动，也没有数据库迁移。新版镜像在
 [Releases](https://github.com/zulongnas/homeeye/releases) 里能找到对应版本号
-（tag 就是镜像 tag，例如 `1.2.0`）。
+（tag 就是镜像 tag，例如 `1.2.1`）。
 
 ## 七、监控接入（Prometheus / Grafana）
 
@@ -280,6 +280,42 @@ scrape_configs:
 | 切换后自检 | `/api/health` → `version 1.2.0`，两路摄像头 `ok`；生产 `/api/metrics` 23/23 全过；扫描器心跳 0.19 s |
 | 回滚路径 | NAS 上 `/tmp/homeeye-src-1.1.4.tgz` + 同目录 `src.old`；`homeeye-nas:1.1.4` 镜像仍在，compose 的 image 改回 1.1.4 再 `up -d` 即回滚 |
 | Release 附件回读 | 在 NAS 上 `curl` 下载附件（本机直连被网络拦，NAS 重试后成功）：5,774,114 B、md5 `37e71d2a…`，与本地出包一致 |
+
+**1.2.1（直播闪现后黑屏 / 时间戳定格）修复，2026-10-31：**
+
+用户反馈：实时画面"能瞬间出来、瞬间又没了"，有时黑屏等一会儿直接报错；主卧摄像头
+左上角时间戳定住不动。复现与定位结论：**两道服务端竞态 + 一道前端静默失败**。
+
+| 根因 | 代码位置 | 现象 |
+|---|---|---|
+| `_spawn()` 无互斥：`add_sub()` 与 `tick()` 都会起 ffmpeg | `app/server/nw_live.py` | 单个观看端就能起 2 路 ffmpeg（实测间隔 0.9 s、ppid=1 常驻 435 s），两条 PTS 时间线交错喂同一路，解码器报 `PIPELINE_ERROR_DECODE` |
+| 读线程不校验"自己是否还是当前发布进程" | `nw_live.py::_read_loop/_feed` | 被顶替的旧 ffmpeg 继续往订阅者写，孤儿进程永不退出 |
+| `add_sub()` 先挂订阅、后补历史段 | `nw_live.py::add_sub` | 实时批次抢在历史段前面，时间戳倒着走 |
+| 前端 ERROR 只显示"自动重试中…"，实际没有重试 | `app/www/app.js::attachStream` | 解码器一旦被坏时间线搞死，格子永久黑屏 |
+| MSE 在时间戳跳变后静默停住（不抛 ERROR） | `app/www/app.js` | 断电/重连后画面定格、时间戳不动，只能手动刷新 |
+| tile 登记被 `player:null` 覆盖 | `app/www/app.js::makeTile` | 切页面时播放器不销毁，服务端订阅泄漏、ffmpeg 永不休息 |
+
+证据（1.2.0 镜像 / NAS 真机）：同一路 `zwcam_low` 存在 2 个 ppid=1 的 ffmpeg；
+抓 `/live/c1.ts?q=low` 15 秒，ffprobe 报 6 处 PTS 回退、ffmpeg 解码 16 行错误
+（`mmco: unref short failure`）；修复后同条件 **0 回退、0 解码错误**。
+
+修复内容：
+- `_spawn()` 两段式加锁（先便宜判断、再持锁复检后提交），已有存活发布进程时直接返回；
+- `_read_loop` / `_feed` / `_err_loop` 绑定进程身份，被顶替的进程立即停止喂流并被 kill；
+- 每次新起 ffmpeg 清空环形缓冲、老订阅者重新等 IDR（两条时间线不混）；
+- `add_sub()` 在锁内先灌历史段再挂订阅；首段历史最多可到整环 4 MB（主码流大 GOP 不再被 2 MB 上限清空）；
+- `_live_stream()` 短暂无数据不再立刻收尾（进程活 48 s / 进程死 24 s 才断），避免浏览器看到假 NetworkError；
+- 前端：ERROR 时真正重建播放器（1→8 s 指数退避）；新增 2 秒轮询的"静默卡死"看门狗（currentTime 连续 6 秒不动即重建）；
+- 前端：修掉 tile 条目被覆盖（播放器现在会随视图切换销毁，服务端订阅归零）。
+
+**1.2.1 三轮验证（2026-10-31）：**
+
+| 轮次 | 内容 | 结果 |
+|---|---|---|
+| 本地逻辑 | `test_single_publisher.py`（8 线程并发 `add_sub` + 拉长 `cmdline` 复现竞态）、`test_keyframe_offset.py`、`py_compile`、`node --check` | 1.2.0 代码起 **8 路** ffmpeg（断言失败，成功复现）；修复后 **1 路**；崩溃重启、停止、关键帧对齐全过 |
+| 容器 A/B | 同机 `homeeye-nas:1.2.0`（未修）与补丁版，同源同配置，抓 15 秒 TS 比对 | 未修：53 包、6 处 PTS 回退、16 行解码错误；修复：180 包、0 回退、0 错误 |
+| 并发与恢复 | 6 观看端同时开播；kill 发布进程；切视图 | ffmpeg 峰值 1 路；kill 后 tick 2 秒内重起，浏览器约 10 秒内自动恢复；切视图后服务端订阅归 0 |
+| 浏览器真机 | Chrome 两路网格 / 单画面主码流，连续播放 60 秒 + 中断恢复 | 无 MediaError / NetworkError，currentTime 持续前进，控制台无一条 warn/error |
 
 ### 没验证的（别照着这些吹）
 

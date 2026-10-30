@@ -216,7 +216,7 @@ class Subscriber(object):
         self.t0 = time.time()
         self.needs_key = needs_key
 
-    def push(self, data, koff=-1):
+    def push(self, data, koff=-1, cap=_MAX_BACKLOG):
         with self.cv:
             if self.closed:
                 return
@@ -229,7 +229,7 @@ class Subscriber(object):
                 self.needs_key = False
             self.q.append(data)
             total = sum(len(x) for x in self.q)
-            if total > _MAX_BACKLOG:
+            if total > cap:
                 # 积压到这份上说明这一路已经追不上了。继续喂只会让浏览器
                 # 拿到中间断掉的一段，解出绿带；不如整条作废，等下个 IDR。
                 self.q.clear()
@@ -341,27 +341,47 @@ class LiveCam(object):
         return cmd
 
     def _spawn(self):
-        try:
-            self._proc = subprocess.Popen(
-                self.cmdline(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                bufsize=0, close_fds=True,
-            )
-        except Exception as e:
-            self._proc = None
-            self.error = "启动 ffmpeg 失败：%s" % e
-            return
-        self.started_at = time.time()
-        self.frames = 0
-        self.error = ""
-        self._reader = threading.Thread(target=self._read_loop, args=(self._proc,), daemon=True)
-        self._reader.start()
-        threading.Thread(target=self._err_loop, args=(self._proc,), daemon=True).start()
+        # 便宜的先看一眼：已经有一路在跑就绝不再起第二路。add_sub 和 tick
+        # 会并发进来，以前两边都看到 _proc 为空、各起一个 ffmpeg，两条时间线
+        # 交错喂给同一个 LiveCam —— 浏览器解码器直接报错（1.2.0 花屏回潮的真凶）。
+        with self._lock:
+            p = self._proc
+            if p is not None and p.poll() is None:
+                return
+        cmd = self.cmdline()          # 含 ffprobe 探测，可能慢，不能占着锁
+        with self._lock:
+            p = self._proc
+            if p is not None and p.poll() is None:
+                return                # 等锁这段时间别人已经起好了
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    bufsize=0, close_fds=True,
+                )
+            except Exception as e:
+                self._proc = None
+                self.error = "启动 ffmpeg 失败：%s" % e
+                return
+            self._last_spawn_try = time.time()
+            self._proc = proc
+            self.started_at = time.time()
+            self.frames = 0
+            self.error = ""
+            # 新一路的时间戳和旧一路没有连续性：缓冲清掉，老订阅者重新等下个 IDR，
+            # 否则浏览器会收到一段往前跳的时间线，同样解不动。
+            self._ring.clear()
+            self._ring_len = 0
+            for s in list(self._subs):
+                s.needs_key = True
+            self._reader = threading.Thread(target=self._read_loop, args=(proc,), daemon=True)
+            self._reader.start()
+        threading.Thread(target=self._err_loop, args=(proc,), daemon=True).start()
 
     def _err_loop(self, proc):
         try:
             for line in iter(proc.stderr.readline, b""):
                 s = line.decode("utf-8", "replace").strip()
-                if s:
+                if s and self._proc is proc:
                     self.error = s[-300:]
         except Exception:
             pass
@@ -371,6 +391,8 @@ class LiveCam(object):
         out = proc.stdout
         try:
             while True:
+                if self._proc is not proc:
+                    break             # 被替换/被停掉：别再往订阅者身上喂
                 chunk = out.read(32768)
                 if not chunk:
                     break
@@ -398,25 +420,37 @@ class LiveCam(object):
                         break
                     self.frames += 1
                     self._latest = time.time()
-                    self._feed(batch, _keyframe_offset(batch, self._codec))
+                    if not self._feed(batch, _keyframe_offset(batch, self._codec), proc):
+                        return
         except Exception as e:
             self.error = "read: %s" % e
         finally:
             try:
                 proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             with self._lock:
                 if self._proc is proc:
                     self._proc = None
+                else:
+                    try:
+                        proc.kill()    # 被顶替的进程必须收掉，否则它会继续写满管道
+                    except Exception:
+                        pass
 
-    def _feed(self, batch, koff=-1):
+    def _feed(self, batch, koff=-1, proc=None):
         """把一批 TS 字节写进环形缓冲并广播给所有订阅者。
 
         koff 是这批里最后一个关键帧起始包的偏移（没有则 -1），环形缓冲要记住它，
-        新订阅者才知道该从哪里开始喂浏览器。
+        新订阅者才知道该从哪里开始喂浏览器。proc 是产这批数据的进程：已经不是
+        当前进程就直接丢弃，防止被替换掉的旧 ffmpeg 继续污染时间线。
         """
         with self._lock:
+            if proc is not None and self._proc is not proc:
+                return False
             self._ring.append((batch, koff))
             self._ring_len += len(batch)
             while self._ring_len > _RING:
@@ -424,6 +458,7 @@ class LiveCam(object):
             subs = list(self._subs)
         for s in subs:
             s.push(batch, koff)
+        return True
 
     def _recent(self):
         """新订阅者的秒开数据：环形缓冲里「最后一个 IDR 之后」的那一段。
@@ -443,6 +478,10 @@ class LiveCam(object):
     def _stop_proc(self):
         with self._lock:
             p, self._proc = self._proc, None
+            # 停掉的这一路，缓冲里的数据已经没有接续者了；留着会被新订阅者
+            # 当成"最近画面"喂进去，而它和下一条流的时间戳毫无连续性。
+            self._ring.clear()
+            self._ring_len = 0
         if not p:
             return
         try:
@@ -469,11 +508,12 @@ class LiveCam(object):
             # 也不要从 GOP 中间开吃 —— 那正是那条绿带。
             recent, aligned = self._recent()
             s = Subscriber(needs_key=not aligned)
+            # 先把历史段塞进队列、再挂上订阅：顺序反过来，实时批次会抢在
+            # 历史段前面，浏览器收到的时间戳就倒着走了（解码错误的直接来源）。
+            if recent:
+                s.push(recent, 0, cap=_RING)
             self._subs.append(s)
             self._last_active = time.time()
-        # 新订阅者先把「最后一个 IDR 之后」这段吃进去（含 PAT/PMT/SPS/PPS/I 帧），秒开
-        if recent:
-            s.push(recent, 0)
         if need:
             self._spawn()
         return s

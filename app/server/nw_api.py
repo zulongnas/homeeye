@@ -33,7 +33,7 @@ import nw_live as L
 import nw_record as R
 import nw_watchdog as W
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BOUNDARY = "nwframe"
 
 _live = None
@@ -610,12 +610,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             deadline = time.time() + 3600 * 12
             data = first
-            while data and time.time() < deadline:
-                try:
-                    self._write_chunk(data)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
+            misses = 0
+            while time.time() < deadline:
+                if data:
+                    misses = 0
+                    try:
+                        self._write_chunk(data)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
                 data = sub.take(8.0)
+                if data:
+                    continue
+                if sub.closed:
+                    break
+                # 一次空转不代表这路流死了：低帧率、等下一个 IDR、看门狗刚重启
+                # ffmpeg，都会短暂没数据。以前这里立刻收尾，浏览器就显示
+                # NetworkError —— 用户看到的是"画面闪一下又没了"。
+                misses += 1
+                alive = getattr(lc, "alive", None)
+                running = bool(alive()) if callable(alive) else True
+                if (running and misses >= 6) or (not running and misses >= 3):
+                    break
             # 正常收尾：写终止块，避免浏览器把"连接直接断"当异常
             try:
                 self.wfile.write(b"0\r\n\r\n")

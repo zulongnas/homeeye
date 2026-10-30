@@ -160,6 +160,45 @@
       destroyPlayer(tiles[k]);
     });
     tiles = {};
+    liveWatch.seen = {};
+    if (liveWatch.timer) {
+      clearInterval(liveWatch.timer);
+      liveWatch.timer = null;
+    }
+  }
+
+  /* 实时画面看门狗：时间戳跳变（摄像机重连、ffmpeg 重启）时 MSE 会**悄悄**
+     停住 —— 不抛 ERROR、不触发重试，画面定格、左上角时间戳也不动，用户只能
+     手动刷新。这里每 2 秒看一眼 currentTime 有没有前进，连续 6 秒不动就重建
+     播放器。attachStream 的 ERROR 重试管"报错"，这里管"不报错但死了"。 */
+  var liveWatch = { timer: null, seen: {} };
+
+  function watchTick() {
+    if (state.view !== "live") return;
+    Object.keys(tiles).forEach(function (k) {
+      var e = tiles[k];
+      if (!e || !e.video || !e.cam) return;
+      var v = e.video;
+      var s = liveWatch.seen[k] || (liveWatch.seen[k] = { t: -1, stalls: 0 });
+      // 还没起播（等关键帧/刚加载）不算卡住：交给 ERROR 重试和首段等待
+      if (v.paused || v.readyState < 2 || !v.currentTime) {
+        s.t = -1;
+        s.stalls = 0;
+        return;
+      }
+      if (s.t >= 0 && Math.abs(v.currentTime - s.t) < 0.2) {
+        s.stalls += 1;
+        if (s.stalls >= 3) {
+          s.t = -1;
+          s.stalls = 0;
+          showTileErr(e.tile, e.cam, "画面卡住，正在重连…");
+          scheduleRetry(v, e.tile, e.cam, e.tier, 0);
+        }
+      } else {
+        s.stalls = 0;
+      }
+      s.t = v.currentTime;
+    });
   }
 
   /* 录像状态只做标签的增量更新，**不重建 tile**。
@@ -322,6 +361,7 @@
       if (only) only.classList.add("single");
     }
     refreshSoundBtn();
+    if (!liveWatch.timer) liveWatch.timer = setInterval(watchTick, 2000);
   }
 
   // ---- 云台（PTZ）--------------------------------------------------------
@@ -689,7 +729,9 @@
     var tier = single || state.focusId ? "high" : "low";
     attachStream(video, tile, cam, tier);
     tile.appendChild(video);
-    tiles[cam.id] = { video: video, player: null, tile: tile, tier: tier };
+    // 播放器登记在 attachStream 里（连 cam/tier 一起），这里不能再写一遍：
+    // 早先这行把正好的条目覆盖成 player:null，结果切页面时播放器没被销毁，
+    // 服务端订阅一直挂着（ffmpeg 永远不休息），看门狗也找不到这一格。
 
     // 每格单独的声音按钮：两路同时出声会混在一起，所以要能只开这一路
     var snd = el("button", "tile-sound" + (video.muted ? " off" : ""),
@@ -751,7 +793,8 @@
     return tile;
   }
 
-  function attachStream(video, tile, cam, tier) {
+  function attachStream(video, tile, cam, tier, attempt) {
+    attempt = attempt || 0;
     if (!window.mpegts) {
       showTileErr(tile, cam, "mpegts.js 未加载");
       return;
@@ -778,7 +821,7 @@
       enableWorker: false,
       autoCleanupSourceBuffer: true
     });
-    tiles[cam.id] = { video: video, player: player, tile: tile };
+    tiles[cam.id] = { video: video, player: player, tile: tile, cam: cam, tier: tier };
     player.attachMediaElement(video);
 
     player.on(mpegts.Events.ERROR, function (type, detail) {
@@ -797,6 +840,9 @@
       var old = tile.querySelector(".tile-err");
       if (old) old.remove();
       showTileErr(tile, cam, msg);
+      // 以前这里只显示"自动重试中…"，其实什么都没重试：解码器一旦被坏时间线
+      // 搞死，画面就永久停在那。这里真的重建播放器（指数退避，最长 8 秒一次）。
+      scheduleRetry(video, tile, cam, tier, attempt);
     });
     player.on(mpegts.Events.MEDIA_INFO, function (info) {
       var err = tile.querySelector(".tile-err");
@@ -804,6 +850,21 @@
     });
     player.load();
     video.play().catch(function () {});
+  }
+
+  function scheduleRetry(video, tile, cam, tier, attempt) {
+    var delay = Math.min(1000 * Math.pow(2, attempt || 0), 8000);
+    setTimeout(function () {
+      // 视图已切走 / 格子已重建：这次重试作废
+      var cur = tiles[cam.id];
+      if (state.view !== "live" || !tile.isConnected || !cur || cur.tile !== tile) return;
+      try { cur.player.unload(); } catch (e) {}
+      try { cur.player.detachMediaElement(); } catch (e) {}
+      try { cur.player.destroy(); } catch (e) {}
+      delete tiles[cam.id];
+      try { video.removeAttribute("src"); video.load(); } catch (e) {}
+      attachStream(video, tile, cam, tier, (attempt || 0) + 1);
+    }, delay);
   }
 
   function showTileErr(tile, cam, msg) {
