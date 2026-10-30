@@ -1,5 +1,26 @@
 #!/bin/bash
+# ============================================================================
+# HomeEye · 在应用中心里改完配置之后
+#
+# 配置向导只有一个字段：录像存放目录。留空 = 保持现在这样（这点和安装向导不同，
+# 装的时候留空是"用默认"）。
+#
+# 服务不用重启：HomeEye 按 mtime 重载 config.json，最迟下一个录像切片就写到新目录。
+# 老分段不搬 —— 把用户几十 GB 视频悄悄挪走这种事，必须由人自己决定。
+# ============================================================================
+set -u
 
-### This script is called after the user change environment variables in application setting page.
+DEST="${TRIM_APPDEST:-/var/apps/homeeye/target}"
+HELPER="$DEST/scripts/apply_storage_dir.sh"
+USERLOG="${TRIM_TEMP_LOGFILE:-}"
 
+export HE_APPLY_MODE=config
+
+if [ ! -f "$HELPER" ]; then
+  echo "找不到 $HELPER：这次改的录像目录没生效，去 HomeEye 设置页里改一次" \
+    >>"${USERLOG:-/dev/null}" 2>/dev/null
+  exit 1
+fi
+
+bash "$HELPER" || true
 exit 0

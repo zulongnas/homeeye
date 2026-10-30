@@ -18,6 +18,8 @@ config/privilege text eol=lf
 config/resource text eol=lf
 app/ui/config text eol=lf
 cmd/* text eol=lf
+# 飞牛向导文件没有扩展名（wizard/install、wizard/config…），按名字钉
+wizard/* text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
 LICENSE text eol=lf

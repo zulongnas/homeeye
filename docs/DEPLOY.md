@@ -12,6 +12,7 @@
 
 ```sh
 git clone https://github.com/zulongnas/homeeye.git homeeye && cd homeeye/docker
+cp .env.example .env          # 选存放路径；直接回车不改也能跑（用仓库下的 data/ 与 rec/）
 docker compose up -d --build
 docker compose ps
 curl -s http://127.0.0.1:8088/api/health | head -c 300
@@ -19,28 +20,33 @@ curl -s http://127.0.0.1:8088/api/health | head -c 300
 
 浏览器打开 `http://<这台机器的IP>:8088` → 设登录密码 → 设置 → 摄像头 → 添加。
 
-落盘位置（都在仓库根下，`.gitignore` 已经排除，别提交）：
+落盘位置（宿主机路径全在 `docker/.env` 里，默认在仓库根下，`.gitignore` 已排除，别提交）：
 
 ```
-data/config.json     配置：摄像头、录像策略、通知、登录口令派生值
-data/recordings/     录像分段 MP4（按摄像头 ID 分目录）
-data/xiaomi_auth/    米家授权缓存（access/refresh token）
-data/tls/            自签证书（8443 用）
-go2rtc/go2rtc.yaml   go2rtc 的配置（只有用小米/硬转才需要）
+$HE_DATA_VOLUME/config.json     配置：摄像头、录像策略、通知、登录口令派生值
+$HE_DATA_VOLUME/xiaomi_auth/    米家授权缓存（access/refresh token）
+$HE_DATA_VOLUME/tls/            自签证书（8443 用）
+$HE_REC_VOLUME/                 录像分段 MP4（按摄像头 ID 分目录）
+go2rtc/go2rtc.yaml              go2rtc 的配置（只有用小米/硬转才需要）
 ```
 
 ## 二、要改的三个地方
 
 1. **时区** `TZ`。录像文件名按它命名，填错回放时间轴就对不上。
-2. **录像目录**。默认 `../data:/data` 跟仓库在一起。要放到大容量卷：
-   ```yaml
-   volumes:
-     - /mnt/bigvol/homeeyeRec:/rec     # 宿主机上先 mkdir 好
+2. **存放路径**（`docker/.env` 里两行，不用碰 compose）：
+   ```sh
+   HE_DATA_VOLUME=/mnt/nas1/homeeye-data   # 配置 + 授权缓存 + 证书
+   HE_REC_VOLUME=/mnt/bigvol/homeeyeRec    # 录像（一天几十 GB，认真挑块盘）
    ```
-   然后设置页 → 存储 → 录像目录填 `/rec`。
-   ⚠️ 飞牛上必须写**真实**的 `/volN/1000/...` 路径：`/fs/...` 只是文件管理器的显示层，
+   改完 `docker compose up -d` 重建容器生效；换目录后旧分段不会自动搬，自己拷。
+   容器里这两个路径固定是 `/data` 和 `/rec`，所以设置页里看到的录像目录是 `/rec`
+   —— 宿主机在哪儿由 `.env` 决定，这一层分工是刻意的：设置页管"容器里往哪写"，
+   `.env` 管"这台机器的哪块盘"。
+   ⚠️ 飞牛上必须写**真实**的 `/volN/...` 路径：`/fs/...` 只是文件管理器的显示层，
    bind mount 认不到它。挂进来以后设置页的下拉才会出现这一项；没挂就是没挂，
    页面会如实说。
+   不想单独挂录像盘：把 compose 里 `/rec` 那行挂载和 `HE_REC_DIR=/rec` 一起删掉
+   （只删一行会把录像写进容器可写层，重建就没了），录像就落在 `$HE_DATA_VOLUME/recordings/`。
 3. **网络模式**。见 README「为什么默认 host 网络」。
 
 ## 三、加摄像头

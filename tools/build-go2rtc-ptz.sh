@@ -2,7 +2,7 @@
 # 构建 HomeEye 定制版 go2rtc 镜像 + 云台侧车 heptz。
 #
 #   sh tools/build-go2rtc-ptz.sh
-#   TAG=homeeye/go2rtc:1.1.2-ptz sh tools/build-go2rtc-ptz.sh
+#   TAG=homeeye/go2rtc:1.1.3-ptz sh tools/build-go2rtc-ptz.sh
 #
 # 为什么要有这个脚本：小米云台控制与语音对讲走 Mi Home 的 miss 私有命令，官方
 # go2rtc 不开放，所以我们在 upstream v1.9.15 上打了 15 个文件的补丁。补丁文件
@@ -21,7 +21,7 @@ VER="${VER:-v1.9.15}"
 # upstream tarball 的 sha256（2026-10-29 取自 codeload 的 refs/tags/v1.9.15）。
 # 上游如果重新打 tag，这里会当场报错而不是悄悄编出别的东西 —— 那正是要的效果。
 UPSTREAM_SHA256="${UPSTREAM_SHA256:-08901ecc03ec031b1af13268e6e62370ba7f887b30f98866624d683e0486c084}"
-TAG="${TAG:-homeeye/go2rtc:1.1.2-ptz}"
+TAG="${TAG:-homeeye/go2rtc:1.1.3-ptz}"
 BASE="${BASE:-alexxit/go2rtc:master-hardware}"
 GOIMG="${GOIMG:-golang:1.26-alpine}"
 GOPROXY_="${GOPROXY:-https://goproxy.cn,direct}"

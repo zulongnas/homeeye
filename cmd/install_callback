@@ -1,5 +1,28 @@
 #!/bin/bash
+# ============================================================================
+# HomeEye · 安装完成后
+#
+# 只做一件实事：把安装向导里用户选的录像目录落到 config.json（逻辑在
+# app/scripts/apply_storage_dir.sh，和「配置」向导共用一份，两边不会漂）。
+# 目录之外的东西一律不碰 —— 默认配置由服务第一次运行时自己建，装这一步写一份
+# 可能与服务版本不一致的配置进去，只会埋坑。
+#
+# 钩子可重复执行（官方明示），跑两次结果一样。
+# ============================================================================
+set -u
 
-### This script is called after the user installs the application.
+DEST="${TRIM_APPDEST:-/var/apps/homeeye/target}"
+HELPER="$DEST/scripts/apply_storage_dir.sh"
+USERLOG="${TRIM_TEMP_LOGFILE:-}"
 
+export HE_APPLY_MODE=install
+
+if [ ! -f "$HELPER" ]; then
+  echo "找不到 $HELPER：录像目录先用默认，装完可以在设置页里改" \
+    >>"${USERLOG:-/dev/null}" 2>/dev/null
+  exit 0
+fi
+
+# 这一步永远不把安装搞失败：目录问题服务自己会在健康检查里报，装不上才是更大的麻烦
+bash "$HELPER" || true
 exit 0

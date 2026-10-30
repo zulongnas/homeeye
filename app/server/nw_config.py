@@ -405,9 +405,18 @@ def settings_meta():
 
 
 def recordings_root(cfg=None):
+    """录像目录的三级取值：设置页填的 > 部署方指定的 HE_REC_DIR > 数据目录下面。
+
+    HE_REC_DIR 是给 Docker/包安装这类"部署方决定盘在哪"的场景留的：compose 把大卷
+    bind 成 /rec 并设 HE_REC_DIR=/rec，用户想换盘只改 .env 里一行宿主机路径，不用
+    进容器改配置；而用户在设置页里真填过目录时，页面说的算（env 只是出厂默认，
+    不能反过来盖掉用户的选择）。
+    """
     cfg = cfg or load()
     d = (cfg.get("storage") or {}).get("dir") or ""
-    return d or os.path.join(PKGVAR, "recordings")
+    if d:
+        return d
+    return os.environ.get("HE_REC_DIR") or os.path.join(PKGVAR, "recordings")
 
 
 def ensure_dirs():

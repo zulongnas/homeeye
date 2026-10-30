@@ -31,7 +31,7 @@ import nw_live as L
 import nw_record as R
 import nw_watchdog as W
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 BOUNDARY = "nwframe"
 
 _live = None

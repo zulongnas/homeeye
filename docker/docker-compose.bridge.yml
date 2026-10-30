@@ -39,20 +39,24 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: homeeye:1.1.2
+    image: homeeye:1.1.3
     container_name: homeeye
     restart: unless-stopped
     depends_on:
       - go2rtc
     environment:
       - HE_DATA_DIR=/data
+      # 录像在容器里的 /rec，宿主机路径由 docker/.env 的 HE_REC_VOLUME 决定。
+      # 下面 /rec 挂载和这一行要删一起删（只删一行会把录像写进容器可写层）。
+      - HE_REC_DIR=/rec
       - HE_HOST=0.0.0.0
       - HE_PORT=8088
       - HE_TLS_PORT=8443
       - HE_MILOCO_SDK=/app/sdk/miloco-sdk-main
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-Asia/Shanghai}
     volumes:
-      - ../data:/data
+      - ${HE_DATA_VOLUME:-../data}:/data
+      - ${HE_REC_VOLUME:-../rec}:/rec
     ports:
       - "8088:8088"
       - "8443:8443"

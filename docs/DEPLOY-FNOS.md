@@ -14,7 +14,8 @@
 sh tools/pack-fpk.sh            # 产出 homeeye.fpk（用官方 fnpack 校验 + 注入 checksum）
 ```
 
-装完打开是**零配置**：没有摄像头、没有米家账号、没有录像。第一件事是设登录密码。
+装完打开是**零配置**：没有摄像头、没有米家账号、没有录像。安装向导只问一件事——
+录像往哪个目录写（不知道选啥就留空，用飞牛给本应用开的共享目录）——第一件事仍然是设登录密码。
 
 ## 包结构（本仓库根目录就是 fnpack 的源目录）
 
@@ -26,17 +27,46 @@ ICON_256.PNG          256x256   PNG 或 JPG、sRGB、≤1024KB、完整正方形
 app/server/*.py       后端        }
 app/www/*             前端        } 打成 app.tgz，tgz 根 = app/ 的内容
 app/bin/heptz         云台侧车    }
+app/scripts/*.sh      生命周期脚本共用的助手（录像目录落地）
 app/ui/config         桌面入口 + 统一网关注册
 app/ui/images/*       入口图标
 cmd/main              start/stop/status
 cmd/{install,upgrade,uninstall}_{init,callback}   6 个钩子（必填）
+cmd/{config_init,config_callback}                配置向导前后钩子
+wizard/install        安装向导：选录像存放目录（field=wizard_rec_dir）
+wizard/config         配置向导：改录像存放目录（同一个 field，留空=不改）
 config/privilege      运行身份
 config/resource       共享目录声明
 ```
 
-`cmd/config_init`、`cmd/config_callback` 实测可缺省（本项目仍然带上，保持与官方脚手架一致）。
-`wizard/` 在文档的校验表里列为必填、实测缺失也能打包 —— 本项目不带，
-由 fnpack 补一个空目录。
+`cmd/config_init`、`cmd/config_callback` 实测可缺省（本项目仍然带上：配置向导要靠
+`config_callback` 把用户改的目录写进配置）。
+
+## 安装时选录像目录（向导）
+
+飞牛把向导里每个 `field` 的名字**原样**变成环境变量交给生命周期脚本，所以
+`wizard/install` 里那个 `wizard_rec_dir` 就是 `cmd/install_callback` 读到的值。
+落地的活儿在 `app/scripts/apply_storage_dir.sh`（安装与配置两个钩子共用一份，
+两边不会漂），规则三条：
+
+- **留空 = 默认目录**：`$TRIM_DATA_SHARE_PATHS` 第一项（飞牛为本应用开的共享目录，
+  就是文件管理器里能看到 HomeEye 那个）下面的 `recordings/`；探不到就退回
+  `$TRIM_PKGVAR/recordings`。装在哪个存储卷，录像就落在哪个卷。
+- **写不进去不硬来**：`mkdir` 失败或不可写 → 记一条用户可见的说明，退回默认目录，
+  绝不留下"设置成功、从此不长录像"的现场。
+- **落盘到 `config.json` 的 `storage.dir`**，而不是只当环境变量留着：飞牛只在
+  安装/配置那一次注入向导值，之后的 `start` 不一定还看得见；而 HomeEye 按 mtime
+  重载配置，落盘的 `storage.dir` 服务立刻能用，设置页也能如实回显。
+
+改地方的两处，都不用重装：
+
+1. 应用中心 → 本应用 → **配置**（`wizard/config`）：填新目录保存，最迟下一个录像
+   切片就写到新目录；留空表示不改。**老分段不搬** —— 把用户几十 GB 视频悄悄挪走
+   这种事必须由人自己决定。
+2. HomeEye 网页 → 设置 → 存储：同一件事，还带一个"本机可见目录 + 剩余空间"的选择器。
+
+坑（社区实测，非官方）：向导 `text` 的 `min/max` 校验的是**字符串长度**，不是数值范围，
+所以路径字段只用 `pattern` 校验格式（`^(|/...)$`：要么留空，要么绝对路径）。
 
 ## manifest 的坑（本项目踩过，别重复）
 
@@ -88,8 +118,10 @@ config/resource       共享目录声明
 
 ## 数据与卸载
 
-- 配置、录像索引、登录态、米家授权缓存都在 `TRIM_PKGVAR`（`@appdata/homeeye`）里，
-  跨版本由系统持有、升级不丢。
+- 配置、登录口令派生值、米家授权缓存、自签证书都在 `TRIM_PKGVAR`（`@appdata/homeeye`）里，
+  跨版本由系统持有、升级不丢。**录像分段本体**按安装向导里选的目录落盘
+  （默认是 `@appshare/homeeye` 下面的 `recordings/`），所以卸载重装后能不能接着看到老录像，
+  取决于那个目录还在不在 —— 本项目刻意不删它。
 - `config/resource` 声明了两个面向用户的共享目录（`homeeye`、`homeeye/data`），
   作用是让**录像能在飞牛文件管理器里直接看/拷**。这是刻意声明的能力，
   官方要求"面向用户的共享目录须在界面或更新说明中说明"—— `manifest` 的 `changelog`
@@ -122,7 +154,7 @@ config/resource       共享目录声明
 - `docker-project` 资源的 compose up 早于任何生命周期钩子，离线镜像 `docker load`
   来不及 → `No such image`。本项目因此走 **native 自持进程**，不依赖 Docker。
 - 向导 `text` 的 `min/max` 按**字符串长度**校验，端口 `9090` 会被拒 → 用 `pattern`。
-  本项目不带向导，绕开了这一类。
+  本项目的向导只有一个路径字段，校验全用 `pattern`（见上面「安装时选录像目录」）。
 - 桌面 iframe 被 `X-Frame-Options: DENY` 拒 → 需要 CSP `frame-ancestors http: https:`。
   本项目走统一网关 socket，同源转发，不撞这一条。
 

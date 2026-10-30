@@ -54,6 +54,42 @@ fi
 if grep -nE "^\s*#" manifest; then
   echo "   !! manifest 里有 # 注释行（见上），删掉"; fail=1
 fi
+# 生命周期脚本依赖包里的这个助手；漏了它，安装向导填了也不落地
+[ -f app/scripts/apply_storage_dir.sh ] || \
+  { echo "   !! 缺 app/scripts/apply_storage_dir.sh（cmd/install_callback 要用）"; fail=1; }
+# 向导文件是 JSON：语法错一个字符，飞牛的安装界面就是一片空白，而且报错很难查。
+# Windows 上 `python3` 常常是应用商店的执行别名（跑起来什么都不打印就返回非 0），
+# 所以先真的执行一次再决定用不用；找不到能用的解释器就明说，别假装体检过了。
+PYC=""
+for c in python3 python /usr/bin/python3; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c "import sys" >/dev/null 2>&1; then
+    PYC="$c"; break
+  fi
+done
+if [ -n "$PYC" ]; then
+  for w in wizard/*; do
+    [ -f "$w" ] || continue
+    "$PYC" - "$w" <<'PYEOF' || fail=1
+import json, sys
+p = sys.argv[1]
+try:
+    steps = json.load(open(p, encoding="utf-8"))
+except Exception as e:
+    print("   !! %s 不是合法 JSON：%s" % (p, e)); sys.exit(1)
+if not isinstance(steps, list) or not steps:
+    print("   !! %s 要是非空数组" % p); sys.exit(1)
+for s in steps:
+    for it in s.get("items") or []:
+        f = it.get("field")
+        if f and not str(f).startswith("wizard_"):
+            # 飞牛把 field 名原样变成环境变量；不带 wizard_ 前缀迟早跟人撞名
+            print("   !! %s 的 field=%s 少了 wizard_ 前缀" % (p, f)); sys.exit(1)
+print("   向导 %s ok" % p)
+PYEOF
+  done
+else
+  echo "   （没有 python，跳过向导 JSON 语法检查）"
+fi
 grep -q "^appname" manifest || { echo "   !! manifest 缺 appname"; fail=1; }
 grep -q "^version" manifest || { echo "   !! manifest 缺 version"; fail=1; }
 # 图标尺寸是审核项：64 与 256，正方形

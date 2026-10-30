@@ -23,12 +23,14 @@
 ```sh
 git clone https://github.com/zulongnas/homeeye.git && cd homeeye
 cd docker
+cp .env.example .env          # 只问一件事：配置和录像各放哪个目录（不改也能跑）
 docker compose up -d --build
 # 浏览器打开 http://<这台机器的IP>:8088
 ```
 
 **飞牛 fnOS 不想碰命令行的**：到 [Releases](https://github.com/zulongnas/homeeye/releases/latest)
-下载 `homeeye.fpk`，应用中心 → 手动安装 → 选这个文件。装完和 Docker 一样是零配置状态。
+下载 `homeeye.fpk`，应用中心 → 手动安装 → 选这个文件；安装向导会问你录像往哪儿写
+（留空就用飞牛给本应用开的共享目录），装完和 Docker 一样是零配置状态。
 （手动安装按飞牛官方的定位是「本地调试用途」，正式分发走应用中心上架，
 对照表在 [docs/DEPLOY-FNOS.md](docs/DEPLOY-FNOS.md)。）
 
@@ -129,6 +131,7 @@ docker/         Dockerfile、compose（host 与 bridge 两份）、go2rtc 配置
 third_party/    go2rtc 补丁版：补丁文件 + MIT 许可 + 逐条改动说明
 tools/          fetch SDK、构建定制版 go2rtc 镜像、出 fpk
 cmd/ config/ manifest  飞牛 fpk 生命周期脚本与包清单（仓库根即 fnpack 源）
+wizard/        飞牛安装/配置向导：装的时候选录像目录
 docs/           部署、安全、隐私、fpk 上架注意
 ```
 
