@@ -40,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: ghcr.io/zulongnas/homeeye:1.1.4
+    image: ghcr.io/zulongnas/homeeye:1.2.0
     container_name: homeeye
     restart: unless-stopped
     depends_on:
@@ -52,6 +52,9 @@ services:
       - HE_REC_DIR=/rec
       - HE_HOST=0.0.0.0
       - HE_PORT=8088
+      # Prometheus 抓取令牌（可选）：填了才能免登录抓 /api/metrics；
+      # 留空 = 只有登录会话能读。生成：openssl rand -hex 24
+      - HE_METRICS_TOKEN=${HE_METRICS_TOKEN:-}
       - HE_TLS_PORT=8443
       - HE_MILOCO_SDK=/app/sdk/miloco-sdk-main
       - TZ=${TZ:-Asia/Shanghai}

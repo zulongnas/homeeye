@@ -9,6 +9,7 @@ CPU 占用基本可以忽略；分段用 ffmpeg 的 segment muxer，按 时钟�
 mp4 用 fragmented 模式（+frag_keyframe+empty_moov），这样正在写入的分段
 也能被浏览器播放（否则 moov 在文件尾，播放器会判定为损坏）。
 """
+import json
 import os
 import re
 import shutil
@@ -37,6 +38,33 @@ SEG_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})\.mp4$")
 
 def _ffmpeg_bin():
     return os.environ.get("HE_FFMPEG") or "ffmpeg"
+
+
+# path -> (mtime, 时长秒)。ffprobe 一次几毫秒到几十毫秒，但 segments() 在
+# playlist 的跨天循环里会被反复调，缓存省的就是这些重复探测。
+_durs = {}
+
+
+def _ffprobe_duration(path):
+    """分段的真实时长（秒），探不出或还在写就返回 0（调用方退回估算值）。"""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return 0
+    hit = _durs.get(path)
+    if hit and hit[0] == mt:
+        return hit[1]
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-hide_banner", "-loglevel", "error",
+             "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8)
+        dur = float((p.stdout or b"").strip() or 0)
+    except Exception:
+        return 0
+    if dur > 0:
+        _durs[path] = (mt, dur)
+    return dur
 
 
 def cam_dir(root, cam_id):
@@ -439,6 +467,33 @@ class Recorder(object):
             time.sleep(900)
 
 
+    def _locked_files(self):
+        """被本地事件引用的录像段（相对路径集合）——清理时留到最后删。"""
+        root = self._root()
+        ev = os.path.join(root, "events")
+        locked = set()
+        if not os.path.isdir(ev):
+            return locked
+        for cid in os.listdir(ev):
+            cdir = os.path.join(ev, cid)
+            if not os.path.isdir(cdir):
+                continue
+            for n in os.listdir(cdir):
+                if not n.endswith(".jsonl"):
+                    continue
+                try:
+                    with open(os.path.join(cdir, n), "r", encoding="utf-8") as f:
+                        for line in f:
+                            try:
+                                fn = json.loads(line).get("file")
+                            except Exception:
+                                continue
+                            if fn:
+                                locked.add(str(fn).replace("\\", "/"))
+                except OSError:
+                    continue
+        return locked
+
     def cleanup(self):
         cfg = self._cfg()
         st = cfg.get("storage") or {}
@@ -462,23 +517,33 @@ class Recorder(object):
                     continue
                 files.append((mt, sz, p))
                 total += sz
-        # 1) 按天数
+        locked = self._locked_files()
+
+        # 1) 按天数：事件锁住的段不按天删（生命周期跟着 keep_events_days 走）
         if days > 0:
             cutoff = now - days * 86400
-            for mt, sz, p in files:
-                if mt < cutoff:
-                    try:
-                        os.unlink(p)
-                        total -= sz
-                    except OSError:
-                        pass
-        # 2) 按容量上限（从最旧开始删）
+            cands = [(mt, sz, p) for mt, sz, p in files
+                     if mt < cutoff
+                     and os.path.relpath(p, root).replace("\\", "/") not in locked]
+            freed = []
+            for mt, sz, p in cands:
+                try:
+                    os.unlink(p)
+                    freed.append(sz)
+                except OSError:
+                    pass
+            total -= sum(freed)
+        # 2) 按容量上限（从最旧开始删，事件锁住的段放最后）
         if budget_gb > 0:
             limit = budget_gb * (1024 ** 3)
             if total > limit:
-                for mt, sz, p in sorted(files):
+                cands = sorted(files, key=lambda x: x[0])
+                for mt, sz, p in cands:
                     if total <= limit:
                         break
+                    rel = os.path.relpath(p, root).replace("\\", "/")
+                    if rel in locked:
+                        continue
                     try:
                         if os.path.exists(p):
                             os.unlink(p)
@@ -521,14 +586,19 @@ class Recorder(object):
                 sz = 0
             starts.append([ts, p, sz])
         starts.sort(key=lambda x: x[0])
-        # 最后一段没有「下一段起点」可参照，按设置里的单段时长估，否则回放时间轴
-        # 会把每段都算成 60 秒，5 分钟的录像在轴上只剩一条细缝。
+        # 最后一段没有「下一段起点」可参照：用 ffprobe 读真实时长（带缓存）。
+        # 以前按设置里的单段时长估，正在写的段会把时间轴撑到 5 分钟，
+        # 点上去却是"这一天没有录像"——误差全让跳转兜底去填。
         try:
             seg_sec = max(60, int((self._cfg().get("storage") or {}).get("segment_minutes") or 5) * 60)
         except Exception:
             seg_sec = 300
         for i, (ts, p, sz) in enumerate(starts):
-            end = starts[i + 1][0] if i + 1 < len(starts) else ts + seg_sec
+            if i + 1 < len(starts):
+                end = starts[i + 1][0]
+            else:
+                dur = _ffprobe_duration(p)
+                end = ts + (dur if dur > 0 else seg_sec)
             out.append({
                 "file": os.path.relpath(p, root).replace(os.sep, "/"),
                 "start": ts,

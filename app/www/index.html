@@ -103,10 +103,12 @@
       <div class="tl-ruler" id="tlRuler"></div>
       <div class="tl-track" id="tlTrack">
         <div class="tl-blocks" id="tlBlocks"></div>
+        <div class="tl-events" id="tlEvents"></div>
         <div class="tl-head" id="tlHead"></div>
       </div>
     </div>
-    <div class="tl-hint">点时间轴任意位置跳转；空白处代表那一刻没有录像</div>
+    <div class="tl-hint">点时间轴任意位置跳转；空白处代表那一刻没有录像，<b>亮色事件块</b>是侦测到「有动静」的时段</div>
+    <div class="ev-strip" id="evStrip" hidden></div>
   </section>
 
   <!-- ================= 设置 ================= -->
@@ -276,9 +278,9 @@
         </div>
         <div class="field-row">
           <div class="field">
-            <label>事件录像额外保留（天）</label>
+            <label>事件明细保留（天，0 = 跟随录像）</label>
             <input id="setKeepEvents" type="number" min="0" max="3650" step="1">
-            <p class="hint h-bad" id="keepEventsWhy"></p>
+            <p class="hint">时间轴事件与缩略图只留这么多天；有事件引用的录像段不会被按天清理提前删掉（容量超限时仍会让路）。</p>
           </div>
           <div class="field">
             <label>录像带音频</label>
@@ -315,8 +317,22 @@
         <div id="motionForm"><p class="hint muted">选择摄像头后自动读取。</p></div>
         <p class="hint">「下发改动」只提交你动过的格子；SD 卡与卡容量是设备只读上报，改不了。</p>
 
-        <!-- HomeEye 侧本地分析参数：确实没有消费者，灰着并说清为什么 -->
-        <h3 class="sub-h3">HomeEye 侧的画面分析参数</h3>
+        <!-- HomeEye 本地事件侦测（1.2.0-C）：真的在跑，产出回放页时间轴上的事件块 -->
+        <h3 class="sub-h3">本地事件侦测（时间轴事件块）</h3>
+        <p class="hint" id="motionLocalState">扫描器：…</p>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setLocalMotion"> <span>启用本地事件侦测</span></label>
+          </div>
+          <div class="field">
+            <label>灵敏度（1~100，越高越容易标出事件）</label>
+            <input id="setLocalSens" type="number" min="1" max="100" step="1">
+          </div>
+        </div>
+        <p class="hint">对写完的录像分段做关键帧差分，每段只花零点几秒 CPU；事件只回溯最近 36 小时，之后随录像持续累积。开关刚打开时，最近一两小时的分段会在几分钟内陆续标出来。</p>
+
+        <!-- 事件式录像参数：确实没有消费者，灰着并说清为什么 -->
+        <h3 class="sub-h3">事件式录像参数（占位）</h3>
         <p class="hint h-bad" id="motionLocalWhy"></p>
         <div class="field-row">
           <div class="field">
@@ -345,13 +361,14 @@
 
       <!-- ---------- 4. 通知告警 ---------- -->
       <div class="card">
-        <h3>通知告警 <span class="card-sub">邮件推送</span></h3>
+        <h3>通知告警 <span class="card-sub">多渠道推送</span></h3>
         <div class="field">
-          <label class="check"><input type="checkbox" id="setNotifyOn"> <span>启用邮件通知</span></label>
+          <label class="check"><input type="checkbox" id="setNotifyOn"> <span>启用通知</span></label>
+          <p class="hint">下面配了哪个渠道就走哪个渠道；都不配则只记录不发送。</p>
         </div>
         <div class="field-row">
           <div class="field">
-            <label>SMTP 服务器</label>
+            <label>SMTP 服务器（邮件）</label>
             <input id="setSmtpHost" type="text" spellcheck="false" placeholder="smtp.qq.com">
           </div>
           <div class="field">
@@ -373,10 +390,34 @@
           <label>收件人（多个用逗号分隔）</label>
           <input id="setToAddrs" type="text" spellcheck="false" placeholder="a@qq.com, b@163.com">
         </div>
+        <div class="field">
+          <label>企业微信群机器人 Webhook</label>
+          <input id="setWecomHook" type="text" spellcheck="false" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>钉钉群机器人 Webhook</label>
+            <input id="setDingHook" type="text" spellcheck="false" placeholder="https://oapi.dingtalk.com/robot/send?access_token=…">
+          </div>
+          <div class="field">
+            <label>钉钉加签密钥（可空）</label>
+            <input id="setDingSecret" type="password" placeholder="留空表示不修改">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Bark 推送地址（iOS）</label>
+            <input id="setBarkUrl" type="text" spellcheck="false" placeholder="https://api.day.app/你的Key">
+          </div>
+          <div class="field">
+            <label>通用 Webhook（POST JSON）</label>
+            <input id="setWebhookUrl" type="text" spellcheck="false" placeholder="https://example.com/hook">
+          </div>
+        </div>
         <div class="field-row">
           <div class="field">
             <label>通知时机</label>
-            <label class="check"><input type="checkbox" id="setOnMotion"> <span>移动侦测（没有这种事件，勾了不会发）</span></label>
+            <label class="check"><input type="checkbox" id="setOnMotion"> <span>移动侦测（本地事件扫出动静时发，布防时段内才发）</span></label>
             <label class="check"><input type="checkbox" id="setOnFault"> <span>摄像头离线</span></label>
           </div>
           <div class="field">
@@ -384,8 +425,31 @@
             <input id="setFaultCd" type="number" min="30" max="86400" step="30">
           </div>
         </div>
+        <div class="field-row">
+          <div class="field">
+            <label>布防撤防</label>
+            <select id="setArmMode">
+              <option value="always">全天布防</option>
+              <option value="sched">按时段布防</option>
+              <option value="off">全天撤防（不发移动通知）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>布防时段（逗号分隔，可跨零点）</label>
+            <input id="setArmRanges" type="text" spellcheck="false" placeholder="22:00-08:00, 12:30-13:30">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setDigestOn"> <span>每日日报（昨天的事件汇总 + 存储占用）</span></label>
+          </div>
+          <div class="field">
+            <label>日报发送小时（0-23）</label>
+            <input id="setDigestHour" type="number" min="0" max="23" step="1">
+          </div>
+        </div>
         <div class="row-end" style="margin-top:2px">
-          <button class="btn ghost" id="btnNotifyTest">发送测试邮件</button>
+          <button class="btn ghost" id="btnNotifyTest">发送测试通知</button>
         </div>
         <div class="field-row">
           <div class="field">
@@ -704,6 +768,11 @@
           <label>流地址</label>
           <input id="camUrl" type="text" spellcheck="false"
                  placeholder="rtsp://admin:密码@192.168.1.64:554/Streaming/Channels/101">
+        </div>
+        <div class="field" id="fieldUrlLow" hidden>
+          <label>子码流地址（选填，多宫格用）</label>
+          <input id="camUrlLow" type="text" spellcheck="false"
+                 placeholder="rtsp://admin:密码@192.168.1.64:554/Streaming/Channels/102">
         </div>
         <div class="field" id="fieldUser" hidden>
           <label>用户名</label>

@@ -36,7 +36,7 @@
     ptz: { available: false, reason: "" },   // 云台侧车是否可用
     ptzOpen: "",                              // 当前展开方向盘的摄像头 id
     play: { cam: null, day: null, segs: [], seg: null, playhead: 0, dayStart: 0,
-            auto: true, offsetBase: 0 }
+            evs: [], auto: true, offsetBase: 0 }
   };
 
   function $(id) { return document.getElementById(id); }
@@ -64,7 +64,13 @@
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(opt.body);
     }
+    // 所有 API 都该有超时：以前没有，后端一卡（NAS 忙、断网中）页面就
+    // 一片"加载中"永远挂着，连错误提示都没有。
+    var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    if (ctrl) init.signal = ctrl.signal;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, opt.timeout || 20000) : null;
     return fetch(url(path), init).then(function (r) {
+      if (timer) clearTimeout(timer);
       return r.json().catch(function () { return {}; }).then(function (j) {
         if (r.status === 401) {
           // 闸门拦下：弹登录框。所有轮询都走这里，所以一次拦截就够。
@@ -82,6 +88,9 @@
         }
         return j;
       });
+    }, function (err) {
+      if (timer) clearTimeout(timer);
+      throw new Error("请求超时或网络异常");
     });
   }
 
@@ -111,6 +120,7 @@
     });
     if (v === "live") mountTiles();
     else unmountTiles();
+    if (v !== "play") destroyPlayPlayer();   // 回放播放器离开回放页就销毁
     if (v === "play") {
       /* 每次进回放页先允许"自动挑一台有录像的"：摄像头列表第一台往往是离线/
          没在录的那台，一进来就"该摄像头无录像"，看着像回放坏了。 */
@@ -269,8 +279,8 @@
 
   function blankTile(single) {
     var tile = el("div", "tile blank" + (single ? " single" : ""));
-    tile.appendChild(el("div", "tile-blank", "空画面"));
-    tile.appendChild(el("div", "tile-blank-sub", "用上方「画面」下拉选择摄像头"));
+    tile.appendChild(el("div", "tile-blank", "空位"));
+    tile.appendChild(el("div", "tile-blank-sub", "这一格还没有摄像头，添加后自动填上"));
     return tile;
   }
 
@@ -294,7 +304,9 @@
     var slots = gridCount();
     renderPickBar(slots);
 
-    var n = state.focusId ? 1 : slots;
+    // 格子数按布局走，不足的位置留空位：只有 2 路时点「九宫格」也该看到 9 个格子，
+    // 否则 4/6/9 三档看起来一模一样，像是按钮坏了。
+    var n = state.focusId ? 1 : Math.max(1, state.grid || 1);
     var picks = ensurePicks(slots);
     if (state.focusId) picks = [String(state.focusId)];
 
@@ -673,9 +685,11 @@
     video.muted = state.muted;
     video.playsInline = true;
     video.alt = cam.name || cam.id;
-    attachStream(video, tile, cam);
+    // 单画面/焦点看主码流，多宫格用子码流省带宽（没配 url_low 时后端自动回落）
+    var tier = single || state.focusId ? "high" : "low";
+    attachStream(video, tile, cam, tier);
     tile.appendChild(video);
-    tiles[cam.id] = { video: video, player: null, tile: tile };
+    tiles[cam.id] = { video: video, player: null, tile: tile, tier: tier };
 
     // 每格单独的声音按钮：两路同时出声会混在一起，所以要能只开这一路
     var snd = el("button", "tile-sound" + (video.muted ? " off" : ""),
@@ -737,7 +751,7 @@
     return tile;
   }
 
-  function attachStream(video, tile, cam) {
+  function attachStream(video, tile, cam, tier) {
     if (!window.mpegts) {
       showTileErr(tile, cam, "mpegts.js 未加载");
       return;
@@ -749,18 +763,20 @@
     var player = mpegts.createPlayer({
       type: "mpegts",        // MPEG-TS 直播流
       isLive: true,
-      url: url("live/" + cam.id + ".ts"),
+      url: url("live/" + cam.id + ".ts?q=" + (tier === "low" ? "low" : "high"))
+    }, {
+      // stash/追帧/lazyLoad 是 config 项，不是数据源项：写错位置会被
+      // mpegts.js 静默忽略，表现为延迟越攒越大也没人管。
       enableStashBuffer: false,   // 直播尽量低延迟
       liveBufferLatencyChasing: true,
-      lazyLoad: false
-    }, {
+      liveBufferLatencyMaxLatency: 2.0,
+      liveBufferLatencyMinRemain: 0.3,
+      lazyLoad: false,
       // 不开 worker：mpegts.js 的 worker 是从 blob 里 new 出来的，在部分
       // Chromium 环境下 worker 内的 fetch 会被拦掉，表现为立刻抛 NetworkError
       // 且**服务端根本收不到请求**（订阅数一直是 0）。主线程解封装足够用。
       enableWorker: false,
-      liveBufferLatencyMaxLatency: 2.0,
-      liveBufferLatencyMinRemain: 0.3,
-      enableAutoCleanupSourceBuffer: true
+      autoCleanupSourceBuffer: true
     });
     tiles[cam.id] = { video: video, player: player, tile: tile };
     player.attachMediaElement(video);
@@ -1006,7 +1022,9 @@
       if (!days.length) {
         box.appendChild(el("span", "hint", "这台摄像头还没有录像"));
         state.play.segs = [];
+        state.play.evs = [];
         renderTimeline([]);
+        renderEventStrip([]);
         $("playerTip").textContent = "该摄像头暂无录像";
         if (state.play.auto) {
           state.play.auto = false;
@@ -1046,10 +1064,19 @@
     var t1 = state.play.dayStart + 86400;
     $("playerTip").textContent = "加载中…";
     $("playerMask").hidden = false;
+    // 事件块独立于录像段加载：扫描器晚几分钟标出事件时，换一下日期就会补上
+    state.play.evs = [];
+    renderEventStrip([]);
+    api("api/events?cam=" + encodeURIComponent(state.play.cam) + "&date=" + day)
+      .then(function (j) {
+        state.play.evs = j.events || [];
+        renderTimeline(state.play.segs, state.play.evs);
+        renderEventStrip(state.play.evs);
+      }).catch(function () {});
     api("api/playlist?cam=" + encodeURIComponent(state.play.cam) + "&from=" + state.play.dayStart + "&to=" + t1)
       .then(function (j) {
         state.play.segs = j.segments || [];
-        renderTimeline(state.play.segs);
+        renderTimeline(state.play.segs, state.play.evs);
         if (!state.play.segs.length) {
           $("playerTip").textContent = "这一天没有录像";
           return;
@@ -1065,7 +1092,7 @@
       }).catch(function (e) { toast(e.message, "err"); });
   }
 
-  function renderTimeline(segs) {
+  function renderTimeline(segs, evs) {
     var ruler = $("tlRuler");
     ruler.innerHTML = "";
     for (var h = 0; h <= 24; h += 3) {
@@ -1084,6 +1111,43 @@
       b.style.width = w + "%";
       b.title = hhmmss(sg.start) + " – " + hhmmss(sg.end);
       blocks.appendChild(b);
+    });
+    // 事件层盖在录像块上面：侦测到"有动静"的时段，点一下直达
+    var evBox = $("tlEvents");
+    evBox.innerHTML = "";
+    (evs || []).forEach(function (ev) {
+      var left = (ev.t0 - d0) / 86400 * 100;
+      var w = Math.max(0.3, (ev.t1 - ev.t0) / 86400 * 100);
+      var b = el("div", "tl-ev");
+      b.style.left = left + "%";
+      b.style.width = w + "%";
+      b.title = "有动静 " + hhmmss(ev.t0) + " – " + hhmmss(ev.t1) + "（点一下跳过去）";
+      b.addEventListener("click", function (e) {
+        e.stopPropagation();
+        jumpTo(ev.t0);
+      });
+      evBox.appendChild(b);
+    });
+  }
+
+  /* 事件缩略图墙：当天每条事件一张截屏，点缩略图直接跳到那一刻 */
+  function renderEventStrip(evs) {
+    var strip = $("evStrip");
+    if (!strip) return;
+    strip.innerHTML = "";
+    strip.hidden = !(evs || []).length;
+    (evs || []).slice(0, 80).forEach(function (ev) {
+      var b = el("div", "ev-card");
+      if (ev.thumb) {
+        var img = document.createElement("img");
+        img.loading = "lazy";
+        img.src = url("api/events/thumb/" + ev.thumb);
+        img.alt = hhmmss(ev.t0);
+        b.appendChild(img);
+      }
+      b.appendChild(el("span", "ev-t", hhmmss(ev.t0)));
+      b.addEventListener("click", function () { jumpTo(ev.t0); });
+      strip.appendChild(b);
     });
   }
 
@@ -1123,49 +1187,65 @@
     return _hevc;
   }
 
+  /* 回放播放器（mpegts.js 实例）。TS 流必须经 MSE 喂给 <video>，
+     每次换段都销毁重建，防止旧实例挂着解码器不放。 */
+  var playPlayer = null;
+  function destroyPlayPlayer() {
+    if (playPlayer) {
+      try { playPlayer.destroy(); } catch (e) {}
+      playPlayer = null;
+    }
+  }
+
   function playSeg(seg, offset) {
     var v = $("player");
     state.play.seg = seg;
     $("playerMask").hidden = true;
     var segLen = Math.max(1, (seg.end || seg.start + 60) - seg.start);
 
-    /* 优先直接播原文件：不耗 CPU、能随便拖进度条。
-       只有浏览器解不了 HEVC 时，才让服务端边转边发（起播慢 2~3 秒，
-       且不能拖进度条，但点了时间轴会按新起点重新请求，体感一样）。 */
-    var direct = canHevc();
-    state.play.offsetBase = 0;
+    /* 回放优先走 /replay：服务端 -ss 定位 + -c copy remux 成 TS（零转码），
+       首字节就是关键帧，从第几秒起播速度都一样 —— 以前直连 fMP4 没有
+       sidx，起播要整文件渐进下载，这就是"转圈圈"的主力。浏览器解不了
+       该编码（H.265）或 remux 播放出错时，回退 /rech264 实时转码。 */
+    var direct = canHevc() && !!window.mpegts && window.mpegts.isSupported();
+    state.play.offsetBase = Math.max(0, offset || 0);
     if (direct) {
-      v.src = url("rec/" + seg.file);
-    } else {
-      state.play.offsetBase = Math.max(0, offset || 0);
-      v.src = url("rech264/" + seg.file +
-                  "?start=" + Math.floor(state.play.offsetBase) +
-                  "&dur=" + Math.ceil(Math.max(1, segLen - state.play.offsetBase)));
-      $("playerTip").textContent = "浏览器不支持 H.265，回放已实时转 H.264（约 2~3 秒起播）";
-    }
-
-    v.addEventListener("loadedmetadata", function once() {
-      v.removeEventListener("loadedmetadata", once);
-      if (direct && offset > 0.4 && offset < (v.duration || 1e9) - 0.3) {
-        try { v.currentTime = offset; } catch (e) {}
-      }
-      // 回放是用户主动点进来的，优先带声音播；被浏览器策略拦下就退回静音，
-      // 播放器本身有音量控件，点一下就能开声。
+      destroyPlayPlayer();
+      playPlayer = mpegts.createPlayer({
+        type: "mpegts",
+        isLive: false,
+        url: url("replay/" + seg.file + "?start=" + Math.floor(state.play.offsetBase))
+      }, {
+        enableWorker: false,
+        enableStashBuffer: false,
+        autoCleanupSourceBuffer: true
+      });
+      playPlayer.attachMediaElement(v);
+      playPlayer.on(mpegts.Events.ERROR, function () {
+        if (!state.play.seg || state.play.seg !== seg) return;
+        recTranscodeFallback(v, seg, segLen, offset);
+      });
+      playPlayer.load();
       v.muted = false;
       v.play().catch(function () {
         v.muted = true;
         v.play().catch(function () {});
       });
-    });
-    v.addEventListener("error", function once2() {
-      v.removeEventListener("error", once2);
-      if (!direct) return;
-      // 原文件解不了（多半是 HEVC 但 canPlayType 谎报支持）→ 兜底走转码
-      if (!state.play.seg) return;
-      state.play.offsetBase = Math.max(0, offset || 0);
-      v.src = url("rech264/" + seg.file +
-                  "?start=" + Math.floor(state.play.offsetBase) +
-                  "&dur=" + Math.ceil(Math.max(1, segLen - state.play.offsetBase)));
+    } else {
+      recTranscodeFallback(v, seg, segLen, offset);
+    }
+  }
+
+  function recTranscodeFallback(v, seg, segLen, offset) {
+    destroyPlayPlayer();
+    state.play.offsetBase = Math.max(0, offset || 0);
+    $("playerTip").textContent = "浏览器不支持该编码，回放已实时转 H.264（约 2~3 秒起播）";
+    v.src = url("rech264/" + seg.file +
+                "?start=" + Math.floor(state.play.offsetBase) +
+                "&dur=" + Math.ceil(Math.max(1, segLen - state.play.offsetBase)));
+    v.muted = false;
+    v.play().catch(function () {
+      v.muted = true;
       v.play().catch(function () {});
     });
   }
@@ -1379,15 +1459,18 @@
   // meta 由后端给（nw_config.UNHONORED），前端不再自己记一遍 —— 免得两边漂移。
   // 组名匹配整组，"组.键" 匹配单项。
   var HONEST_IDS = {
-    "motion": ["setPreSec", "setPostSec",
-               "setMinFrames", "setMaxEvent", "setDetectPersons"],
-    "storage.keep_events_days": ["setKeepEvents"],
-    "notify.on_motion": ["setOnMotion"]
+    "motion.pre_seconds": ["setPreSec"],
+    "motion.post_seconds": ["setPostSec"],
+    "motion.min_frames": ["setMinFrames"],
+    "motion.max_event_seconds": ["setMaxEvent"],
+    "motion.detect_persons": ["setDetectPersons"]
   };
   var HONEST_WHY = {
-    "motion": "motionLocalWhy",
-    "storage.keep_events_days": "keepEventsWhy",
-    "notify.on_motion": ""
+    "motion.pre_seconds": "motionLocalWhy",
+    "motion.post_seconds": "motionLocalWhy",
+    "motion.min_frames": "motionLocalWhy",
+    "motion.max_event_seconds": "motionLocalWhy",
+    "motion.detect_persons": "motionLocalWhy"
   };
 
   function applyHonesty(meta) {
@@ -1545,12 +1628,24 @@
     sv("setWdCooldown", wd.repair_cooldown == null ? 900 : wd.repair_cooldown);
     sv("setWdMaxTries", wd.max_attempts == null ? 3 : wd.max_attempts);
 
-    // HomeEye 侧的画面分析参数（占位，见 applyHonesty）；设备侧的开关走 /api/motion
+    // 本地事件侦测（真的在跑，产出回放页时间轴上的事件块）+ 占位参数
+    sc("setLocalMotion", mo.enabled);
+    sv("setLocalSens", mo.sensitivity);
     sv("setPreSec", mo.pre_seconds);
     sv("setPostSec", mo.post_seconds);
     sv("setMinFrames", mo.min_frames);
     sv("setMaxEvent", mo.max_event_seconds);
     sc("setDetectPersons", mo.detect_persons);
+    api("api/events/status").then(function (j) {
+      var n = $("motionLocalState");
+      if (!n) return;
+      var s2 = j.scanner || {};
+      var at = s2.beat ? new Date(s2.beat * 1000).toLocaleTimeString() : "还没转过一圈";
+      n.textContent = "扫描器：运行中，最近一圈 " + at + (s2.last ? "；" + s2.last : "");
+    }).catch(function () {
+      var n = $("motionLocalState");
+      if (n) n.textContent = "扫描器：状态获取失败";
+    });
 
     // 通知告警
     sc("setNotifyOn", nt.enabled);
@@ -1563,6 +1658,19 @@
       pw.placeholder = nt.smtp_pass_set ? "已设置（留空不修改）" : "留空表示不修改";
     }
     sv("setToAddrs", nt.to_addrs);
+    sv("setWecomHook", nt.wecom_webhook);
+    sv("setDingHook", nt.ding_webhook);
+    var dsec = $("setDingSecret");
+    if (dsec) {
+      dsec.value = "";
+      dsec.placeholder = nt.ding_secret_set ? "已设置（留空不修改）" : "留空表示不修改";
+    }
+    sv("setBarkUrl", nt.bark_url);
+    sv("setWebhookUrl", nt.webhook_url);
+    sv("setArmMode", nt.arming_mode || "always");
+    sv("setArmRanges", nt.arming_ranges);
+    sc("setDigestOn", nt.digest_enabled);
+    sv("setDigestHour", nt.digest_hour);
     sc("setOnMotion", nt.on_motion);
     sc("setOnFault", nt.on_fault);
     sv("setFaultCd", nt.fault_cooldown_s);
@@ -1807,12 +1915,17 @@
           smtp_user: gv("setSmtpUser").trim(),
           smtp_pass: gv("setSmtpPass"),
           from_addr: gv("setSmtpUser").trim(),
-          to_addrs: gv("setToAddrs").trim()
+          to_addrs: gv("setToAddrs").trim(),
+          wecom_webhook: gv("setWecomHook").trim(),
+          ding_webhook: gv("setDingHook").trim(),
+          ding_secret: gv("setDingSecret"),
+          bark_url: gv("setBarkUrl").trim(),
+          webhook_url: gv("setWebhookUrl").trim()
         }
       }}).then(function () {
         return api("api/notify/test", { method: "POST" });
       }).then(function (j) {
-        if (j.ok) toast("测试邮件已发送，请查收", "ok");
+        if (j.ok) toast("测试通知已发送：" + (j.error || "各渠道均 OK"), "ok");
         else toast("发送失败：" + (j.error || "未知原因"), "err");
       }).catch(function (e) {
         toast("发送失败：" + e.message, "err");
@@ -1924,9 +2037,11 @@
         autoplay: gc("setAutoplay"),
         audio: gc("setLiveAudio")
       },
-      // HomeEye 侧的画面分析参数：整组没有消费者（后端 meta 会说明为什么灰着）。
-      // 提交只是为了不改时别丢原值；真正生效的侦测开关在 /api/motion 那面改摄像头。
+      // 本地事件侦测：enabled/sensitivity 是真参数（nw_events 扫描器用）；
+      // 其余是占位（后端 meta 会说明为什么灰着）。提交只为不改时别丢原值。
       motion: {
+        enabled: gc("setLocalMotion"),
+        sensitivity: Math.min(100, Math.max(1, gn("setLocalSens", 50))),
         detect_persons: gc("setDetectPersons"),
         pre_seconds: Math.max(0, gn("setPreSec", 3)),
         post_seconds: Math.max(0, gn("setPostSec", 10)),
@@ -1942,6 +2057,15 @@
         smtp_pass: gv("setSmtpPass"),
         from_addr: gv("setSmtpUser").trim(),
         to_addrs: gv("setToAddrs").trim(),
+        wecom_webhook: gv("setWecomHook").trim(),
+        ding_webhook: gv("setDingHook").trim(),
+        ding_secret: gv("setDingSecret"),
+        bark_url: gv("setBarkUrl").trim(),
+        webhook_url: gv("setWebhookUrl").trim(),
+        arming_mode: gv("setArmMode") || "always",
+        arming_ranges: gv("setArmRanges").trim(),
+        digest_enabled: gc("setDigestOn"),
+        digest_hour: Math.min(23, Math.max(0, gn("setDigestHour", 20))),
         on_motion: gc("setOnMotion"),
         on_fault: gc("setOnFault"),
         fault_cooldown_s: Math.max(30, gn("setFaultCd", 300)),
@@ -1978,6 +2102,7 @@
     };
     // 密码留空 = 不修改，后端也按这个语义处理
     if (!body.notify.smtp_pass) delete body.notify.smtp_pass;
+    if (!body.notify.ding_secret) delete body.notify.ding_secret;
     if (!body.ptz.token) delete body.ptz.token;
     if (!body.ptz.g2r_pass) delete body.ptz.g2r_pass;
 
@@ -2028,6 +2153,7 @@
 
     function vis(id, on) { var n = $(id); if (n) n.hidden = !on; }
     vis("fieldUrl", isRtsp || isOnvif || isUrl);
+    vis("fieldUrlLow", isRtsp || isOnvif || isUrl);
     vis("fieldUser", isRtsp || isOnvif);
     vis("fieldPass", isRtsp || isOnvif);
     vis("fieldDid", isXiaomi);
@@ -2055,6 +2181,7 @@
     applyCamType(t);
     $("camName").value = cam ? (cam.name || "") : "";
     $("camUrl").value = cam ? (cam.url || "") : "";
+    $("camUrlLow").value = cam ? (cam.url_low || "") : "";
     $("camDid").value = cam ? (cam.did || "") : "";
     $("camTransport").value = cam ? (cam.transport || "tcp") : "tcp";
     $("camQuality").value = cam ? ((cam.quality || "HIGH").toUpperCase()) : "HIGH";
@@ -2199,6 +2326,8 @@
       }
       body.url = raw;
       if (!body.url) { toast("流地址不能为空", "err"); return; }
+      // 子码流选填：填了多宫格就用它省带宽，不填自动回落主码流
+      body.url_low = $("camUrlLow").value.trim();
     }
     if (camType === "onvif") {
       var sel = $("camOnvif");

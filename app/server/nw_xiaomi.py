@@ -17,6 +17,7 @@
 依赖：NAS Linux + python3.12 + /tmp/miloco-sdk-main（Windows 本地无法真机取流）。
 """
 import asyncio
+import collections
 import hashlib
 import json
 import os
@@ -493,6 +494,10 @@ class XiaomiStreamer(object):
 
         self._lock = threading.RLock()
         self._subs = []
+        # 秒开缓冲：和 nw_live.LiveCam 同一套语义（按 IDR 对齐，见那里的注释）。
+        # 小米这一路以前完全没有缓冲，新观看端必然从 GOP 中间接入 —— 就是那条绿带。
+        self._ring = collections.deque()
+        self._ring_len = 0
         self._ffmpeg = None
         self._loop = None
         self._loop_thread = None
@@ -519,17 +524,32 @@ class XiaomiStreamer(object):
         self.audio_bytes = 0
 
     # ---------- 订阅（与 LiveCam 同款） ----------
-    def _mk_sub(self):
+    def _mk_sub(self, needs_key=False):
         # 延迟导入，避免 Windows 无 nw_live 时也能 import nw_xiaomi
         import nw_live
-        return nw_live.Subscriber()
+        return nw_live.Subscriber(needs_key=needs_key)
+
+    def _recent(self):
+        """环形缓冲里最后一个 IDR 之后的字节，返回 (字节, 是否已对齐)。"""
+        import nw_live
+        with self._lock:
+            ring = list(self._ring)
+        for idx in range(len(ring) - 1, -1, -1):
+            batch, koff = ring[idx]
+            if koff >= 0:
+                parts = [batch[koff:]] + [b for b, _k in ring[idx + 1:]]
+                return b"".join(parts), True
+        return b"", False
 
     def add_sub(self):
         with self._lock:
-            s = self._mk_sub()
+            recent, aligned = self._recent()
+            s = self._mk_sub(needs_key=not aligned)
             self._subs.append(s)
             self._last_active = time.time()
             need = not self._started
+        if recent:
+            s.push(recent, 0)
         if need:
             self.start()
         return s
@@ -821,6 +841,10 @@ class XiaomiStreamer(object):
                 self._afd = None
         with self._lock:
             self._ffmpeg = proc
+            # 新进程的 TS 流（PAT/PMT、编码参数）和旧的不连续，旧缓冲里的字节
+            # 喂给新订阅者只会解出错帧 —— 清掉，等新流自己攒出第一个 IDR。
+            self._ring.clear()
+            self._ring_len = 0
         asyncio.ensure_future(self._pump_ts(proc))
         asyncio.ensure_future(self._pump_err(proc))
         return proc
@@ -967,10 +991,16 @@ class XiaomiStreamer(object):
                     buf = buf[n:]
                     # 登记"本路正在出数据"，让别的摄像头先让行，别把这条踩掉
                     _touch_active(self.cam_id)
+                    import nw_live
+                    koff = nw_live._keyframe_offset(batch, self.codec)
                     with self._lock:
+                        self._ring.append((batch, koff))
+                        self._ring_len += len(batch)
+                        while self._ring_len > nw_live._RING:
+                            self._ring_len -= len(self._ring.popleft()[0])
                         subs = list(self._subs)
                     for s in subs:
-                        s.push(batch)
+                        s.push(batch, koff)
         except Exception as e:
             self.error = "pump: %s" % e
 

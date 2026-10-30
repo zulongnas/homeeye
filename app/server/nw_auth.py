@@ -24,6 +24,7 @@
 """
 import hashlib
 import hmac
+import os
 import secrets
 import threading
 import time
@@ -204,6 +205,32 @@ def is_gateway(handler):
         return False
 
 
+def metrics_token():
+    """Prometheus 抓取令牌：部署方用 HE_METRICS_TOKEN 指定的环境变量。空 = 未开。"""
+    return (os.environ.get("HE_METRICS_TOKEN") or "").strip()
+
+
+def metrics_token_ok(handler, q):
+    """带对了 Bearer 令牌（或 ?token=）就放行 /api/metrics。"""
+    want = metrics_token()
+    if not want:
+        return False
+    got = ""
+    authz = str(handler.headers.get("Authorization") or "")
+    if authz.lower().startswith("bearer "):
+        got = authz[7:].strip()
+    if not got:
+        try:
+            v = (q or {}).get("token")
+            # parse_qs 给的是 list；直接 str(list) 会把括号也带进来
+            got = str(v[0]) if isinstance(v, (list, tuple)) and v else str(v or "")
+        except Exception:
+            got = ""
+    if not got:
+        return False
+    return hmac.compare_digest(got.encode(), want.encode())
+
+
 def allows(handler, path, method, q):
     """这个方法/路径是否需要登录。返回 True 表示放行。"""
     if not enabled():
@@ -212,9 +239,14 @@ def allows(handler, path, method, q):
         return True
     if path.startswith(_OPEN_PREFIXES):
         return True
-    # 静态：非 /api /live /rec 的一律放行（页面自己要知道"还没登录"）
+    # 静态：非 /api /live /rec /replay 的一律放行（页面自己要知道"还没登录"）
     if not (path.startswith("/api") or path.startswith("/live")
-            or path.startswith("/rec")):
+            or path.startswith("/rec") or path.startswith("/replay")):
+        return True
+    if path.startswith("/api/metrics") and metrics_token_ok(handler, q):
+        # Prometheus 抓取：部署方给了 HE_METRICS_TOKEN 就认 Bearer 令牌。
+        # 放在「认领窗口」前面是故意的：监控应当从部署那一刻就能抓，不必
+        # 等有人第一次登录设完密码。
         return True
     if not configured():
         # 认领窗口：还没设密码时只留「设密码」这一条路。放行整套 API 等于

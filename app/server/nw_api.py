@@ -27,12 +27,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import nw_auth as A
 import nw_config as C
 import nw_env as E
+import nw_events as EV
 import nw_health as H
 import nw_live as L
 import nw_record as R
 import nw_watchdog as W
 
-VERSION = "1.1.4"
+VERSION = "1.2.0"
 BOUNDARY = "nwframe"
 
 _live = None
@@ -43,6 +44,136 @@ _httpd = None
 # ---------------------------------------------------------------- 工具
 def _json_bytes(obj):
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+_BOOT = time.time()
+_metrics_cache = {"at": 0.0, "text": ""}
+METRICS_TTL = 5.0
+_CAM_STATES = ("ok", "idle", "offline", "broken", "unknown")
+
+
+def _proc_rss_bytes():
+    """进程常驻内存（Linux 读 /proc；其它平台返回 0，指标线就是平的）。"""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _lbl(**kv):
+    parts = []
+    for k in sorted(kv):
+        v = str(kv[k]).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+        parts.append('%s="%s"' % (k, v))
+    return "{" + ",".join(parts) + "}" if parts else ""
+
+
+def _num(v):
+    if v is None:
+        return "0"
+    if isinstance(v, float):
+        s = ("%.3f" % v).rstrip("0").rstrip(".")
+        return s or "0"
+    return str(int(v))
+
+
+def _metrics_text():
+    """Prometheus 文本格式 0.0.4。序列名一律 homeeye_ 前缀。
+
+    只读缓存快照（H.statuses / _live.status / _rec.status），不会因为抓取
+    而触发新一轮探测；整段结果缓存 5 秒，避免多抓取器把 NAS 上的目录遍历
+    放大成负载。
+    """
+    now = time.time()
+    if _metrics_cache["text"] and now - _metrics_cache["at"] < METRICS_TTL:
+        return _metrics_cache["text"]
+    out = []
+
+    def metric(name, typ, help_, rows):
+        out.append("# HELP %s %s" % (name, help_))
+        out.append("# TYPE %s %s" % (name, typ))
+        for labels, value in rows:
+            out.append("%s%s %s" % (name, labels, _num(value)))
+
+    cfg = C.load()
+    cams = [c for c in (cfg.get("cameras") or []) if c.get("enabled", True)]
+    hs = H.statuses()
+    ls = _live.status() if _live is not None else {}
+    rs = _rec.status() if _rec is not None else {}
+    evs = EV.status()
+    ws = W.state()
+    st = H.storage_state()
+    usage = _rec.usage() if _rec is not None else {}
+
+    metric("homeeye_up", "gauge", "HomeEye HTTP 服务在跑", [("", 1)])
+    metric("homeeye_info", "gauge", "版本信息",
+           [(_lbl(version=VERSION), 1)])
+    metric("homeeye_uptime_seconds", "gauge", "进程已运行秒数", [("", now - _BOOT)])
+    metric("homeeye_process_rss_bytes", "gauge", "进程常驻内存字节",
+           [("", _proc_rss_bytes())])
+
+    root = C.recordings_root(cfg)
+    today = time.strftime("%Y%m%d", time.localtime(now))
+    up_rows, state_rows, rec_rows, seg_rows, ev_rows = [], [], [], [], []
+    for cam in cams:
+        cid = str(cam.get("id"))
+        name = cam.get("name") or cid
+        h = hs.get(cid) or {}
+        state = str(h.get("state") or "unknown")
+        lbl = _lbl(camera=cid, name=name)
+        up_rows.append((lbl, 1 if state == "ok" else 0))
+        for s in _CAM_STATES:
+            state_rows.append((_lbl(camera=cid, name=name, state=s),
+                               1 if state == s else 0))
+        rec_rows.append((lbl, 1 if (rs.get(cid) or {}).get("running") else 0))
+        if h.get("segment_age") is not None:
+            seg_rows.append((lbl, h["segment_age"]))
+        ev_rows.append((lbl, len(EV.read_day(root, cid, today))))
+    metric("homeeye_camera_up", "gauge", "摄像头链路正常（state=ok）", up_rows)
+    metric("homeeye_camera_state", "gauge", "摄像头上报状态（0/1 展开）", state_rows)
+    metric("homeeye_recording_up", "gauge", "该路录像进程在跑", rec_rows)
+    metric("homeeye_camera_segment_age_seconds", "gauge",
+           "最新一段录像距今秒数（不录像的路不产出）", seg_rows)
+    metric("homeeye_events_today", "gauge", "今天本地侦测到的事件数", ev_rows)
+
+    metric("homeeye_live_frames_total", "counter", "直播出帧累计",
+           [(_lbl(camera=cid), (v or {}).get("frames") or 0) for cid, v in sorted(ls.items())])
+    metric("homeeye_live_subscribers", "gauge", "直播在线观看端数",
+           [(_lbl(camera=cid), (v or {}).get("subs") or 0) for cid, v in sorted(ls.items())])
+
+    metric("homeeye_storage_ok", "gauge", "录像目录可写且空间足够",
+           [("", 1 if st.get("ok") else 0)])
+    metric("homeeye_storage_free_bytes", "gauge", "录像盘剩余空间",
+           [("", float(st.get("free_gb") or 0) * 1024 ** 3)])
+    metric("homeeye_storage_disk_total_bytes", "gauge", "录像盘总容量",
+           [("", float(st.get("total_gb") or 0) * 1024 ** 3)])
+    metric("homeeye_storage_budget_bytes", "gauge", "配置的录像预算（0 = 不限）",
+           [("", float(st.get("budget_gb") or 0) * 1024 ** 3)])
+    metric("homeeye_recordings_bytes", "gauge", "录像目录当前占用",
+           [("", usage.get("total_bytes") or 0)])
+
+    beat = evs.get("beat") or 0
+    metric("homeeye_scanner_beat_age_seconds", "gauge",
+           "事件扫描最近一次转圈的间隔（-1 = 还没跑过）",
+           [("", (now - beat) if beat else -1)])
+    metric("homeeye_scanner_pending", "gauge", "有待处理的手动扫描请求",
+           [("", 1 if evs.get("pending") else 0)])
+
+    metric("homeeye_watchdog_beat_age_seconds", "gauge", "看门狗最近一次转圈距今秒数",
+           [("", ws.get("beat_age") if ws.get("beat_age") is not None else -1)])
+    metric("homeeye_watchdog_loops_total", "counter", "看门狗循环次数",
+           [("", ws.get("loops") or 0)])
+    metric("homeeye_watchdog_actions_total", "counter", "自愈动作累计次数",
+           [(_lbl(action=k), v) for k, v in sorted((ws.get("stats") or {}).items())])
+
+    text = "\n".join(out) + "\n"
+    _metrics_cache["text"] = text
+    _metrics_cache["at"] = now
+    return text
 
 
 # 飞牛统一网关模式下，前端 <base> 指向 /app/<appname>/；TCP 直连时指向 /
@@ -179,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._live_stream(path, q)
             if path.startswith("/rec/"):
                 return self._file(path, q, head=(method == "HEAD"))
+            if path.startswith("/replay/"):
+                return self._rec_replay(path, q)
             if path.startswith("/rech264/"):
                 return self._rec_transcode(path, q)
             if method in ("GET", "HEAD"):
@@ -257,7 +390,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "video/mp4")
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
-        self.send_header("Cache-Control", "no-store")
+        # 已写完的分段内容不会再变，放行私有缓存一天：回放页反复进出不再
+        # 每次从零下载 —— 一刀切 no-store 是"点回放转圈圈"的另一半原因。
+        # 10 分钟内动过的（正在写的最后一段）仍禁缓存，防止播到半截的文件。
+        try:
+            fresh = time.time() - os.path.getmtime(full) < 600
+        except OSError:
+            fresh = True
+        self.send_header("Cache-Control", "no-store" if fresh else "private, max-age=86400")
         if code == 206:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self.end_headers()
@@ -275,6 +415,69 @@ class Handler(BaseHTTPRequestHandler):
                     left -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    # ---------- 回放 remux（起播优先走这条路） ----------
+    def _rec_replay(self, path, q):
+        """把录像按起点 remux 成 MPEG-TS 边拷边发（-c copy，零转码）。
+
+        为什么需要：fMP4 录像没有 sidx，浏览器拖到中段要先把前面的字节全下完；
+        而整文件渐进下载正是"点回放转圈圈"的主力。这里让服务端用 `-ss`（放在
+        `-i` 前，秒级定位）直接从指定起点吐 TS —— 客户端首字节就是关键帧，
+        无论第几秒起播都是同一个速度。解不了 H.265 的浏览器仍走 /rech264 兜底。
+        """
+        rel = posixpath.normpath(path[len("/replay/"):]).lstrip("/")
+        if rel.endswith(".ts"):
+            rel = rel[:-3]
+        root = os.path.realpath(C.recordings_root())
+        full = os.path.realpath(os.path.join(root, *rel.split("/")))
+        if not full.startswith(root + os.sep) or not os.path.isfile(full):
+            return self._send(404, b"not found", "text/plain")
+        try:
+            start = max(0.0, float((q.get("start") or ["0"])[0]))
+        except ValueError:
+            start = 0.0
+        try:
+            dur = max(0.0, float((q.get("dur") or ["0"])[0]))
+        except ValueError:
+            dur = 0.0
+        cmd = [os.environ.get("HE_FFMPEG") or "ffmpeg",
+               "-hide_banner", "-nostdin", "-loglevel", "error"]
+        if start > 0:
+            # -ss 必须在 -i 前：放在后面 ffmpeg 会先解码整个前缀才能吐帧
+            cmd += ["-ss", "%.3f" % start]
+        cmd += ["-i", full]
+        if dur > 0:
+            cmd += ["-t", "%.3f" % dur]
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                # fMP4 的帧序重排已经定型，进 TS 前把负 PTS 归零，
+                # 否则 mpegts.js 对 DTS 跳变会直接抛 MediaError
+                "-avoid_negative_ts", "make_zero",
+                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, bufsize=0)
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     # ---------- 回放转码（浏览器不支持 H.265 时用） ----------
     def _rec_transcode(self, path, q):
@@ -365,14 +568,16 @@ class Handler(BaseHTTPRequestHandler):
         cam = C.get_camera(cam_id)
         if not cam:
             return self._send(404, b"no such camera", "text/plain")
+        # ?q=low 走子码流（没配 url_low 时 LiveHub 会自动回落主码流）
+        tier = "low" if (q.get("q") or [""])[0] == "low" else "high"
         # 按类型分流：小米走 XiaomiHub，其余走 LiveHub（ffmpeg 拉流）
         if (cam.get("type") or "rtsp").lower() == "xiaomi":
             import nw_xiaomi as X
-            lc = X.get_hub().get(cam)
+            lc = X.get_hub().get(cam)      # 小米 P2P 不开第二路子码流，一律主码流
             sub = lc.add_sub()
             del_fn = lc.del_sub
         else:
-            lc = _live.get(cam)
+            lc = _live.get(cam, tier)
             sub = lc.add_sub()
             del_fn = lc.del_sub
         self.close_connection = True
@@ -425,6 +630,12 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- API ----------
     def _api(self, method, path, q):
         parts = [p for p in path.strip("/").split("/") if p]
+        # /api/metrics —— Prometheus 抓取。鉴权在 nw_auth.allows：
+        # 带对 HE_METRICS_TOKEN，或用登录会话都放行。
+        if parts[:2] == ["api", "metrics"] and method in ("GET", "HEAD"):
+            return self._send(200, _metrics_text().encode("utf-8"),
+                              "text/plain; version=0.0.4; charset=utf-8",
+                              head=(method == "HEAD"))
         # /api/state
         if parts[:2] == ["api", "state"] and method == "GET":
             cfg = C.load()
@@ -452,6 +663,9 @@ class Handler(BaseHTTPRequestHandler):
                 d["rec"]["source_note"] = R.source_note(
                     c, (cfg.get("storage") or {}).get("source") or "PLAYED")
                 d["url_masked"] = _mask_url(c.get("url"))
+                if c.get("url_low"):
+                    d["url_low_masked"] = _mask_url(c.get("url_low"))
+                    d["live_low"] = dict(av.get(cid + "#low") or {})
                 cams.append(d)
             # 云台可用性：前端据此决定是否显示方向盘
             ptz_ok, ptz_why = False, "云台模块未加载"
@@ -565,6 +779,10 @@ class Handler(BaseHTTPRequestHandler):
         if parts[:2] == ["api", "motion"]:
             return self._motion_api(method, parts, q)
 
+        # ---- 本地事件侦测（时间轴事件块）----
+        if parts[:2] == ["api", "events"]:
+            return self._events_api(method, parts, q)
+
         # ---- 云台 PTZ ----
         if parts[:2] == ["api", "ptz"]:
             return self._ptz_api(method, parts, q)
@@ -582,17 +800,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._j({"ok": True, "usage": _rec.usage()})
 
         if parts[:2] == ["api", "notify"]:
-            # POST /api/notify/test -> 立刻发一封测试邮件（不受免打扰/冷却限制）
+            # POST /api/notify/test -> 向所有已配置渠道各发一条测试通知
             if len(parts) == 3 and parts[2] == "test" and method == "POST":
                 try:
                     import nw_notify as N
                 except Exception as e:
                     return self._err("通知模块不可用：%s" % e, 500)
-                ok, err = N.send(
-                    "【HomeEye】测试邮件",
-                    "如果你收到这封邮件，说明 HomeEye 的邮件通知配置正确。\n\n"
+                ok, detail = N.send(
+                    "【HomeEye】测试通知",
+                    "如果你收到这条消息，说明 HomeEye 的通知渠道配置正确。\n\n"
                     "时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
-                return self._j({"ok": ok, "error": err})
+                return self._j({"ok": ok, "error": detail,
+                                "channels": N.channels_status()})
             return self._err("没有这个通知接口：%s" % "/".join(parts), 404)
 
         if parts[:2] == ["api", "settings"]:
@@ -619,7 +838,12 @@ class Handler(BaseHTTPRequestHandler):
                                                    "smtp_ssl", "smtp_user", "smtp_pass",
                                                    "from_addr", "to_addrs", "on_motion",
                                                    "on_fault", "fault_cooldown_s",
-                                                   "dnd_enabled", "dnd_start", "dnd_end")),
+                                                   "dnd_enabled", "dnd_start", "dnd_end",
+                                                   "wecom_webhook", "ding_webhook",
+                                                   "ding_secret", "bark_url",
+                                                   "webhook_url", "arming_mode",
+                                                   "arming_ranges", "digest_enabled",
+                                                   "digest_hour")),
                                        ("auth", ("enabled", "username", "session_hours"))):
                     sec = body.get(group)
                     if not isinstance(sec, dict):
@@ -628,17 +852,26 @@ class Handler(BaseHTTPRequestHandler):
                     # 密码不回显给前端，所以前端提交空串时表示「不修改」
                     if group == "notify" and not picked.get("smtp_pass"):
                         picked.pop("smtp_pass", None)
+                    if group == "notify" and not picked.get("ding_secret"):
+                        picked.pop("ding_secret", None)
                     base = dict(cfg.get(group) or {})
                     cfg[group] = C.normalize(group, picked, base)
                     notes += C.diff_notes(group, picked, cfg[group])
                 if isinstance(body.get("motion"), dict):
-                    # 只剩"本地画面分析"那几个占位参数（见 C.UNHONORED）：照样存，
-                    # 不钳也不假装生效。设备的侦测开关/灵敏度走 /api/motion 直接改摄像头。
-                    cfg.setdefault("motion", {}).update({
-                        k: v for k, v in body["motion"].items()
-                        if k in ("detect_persons", "pre_seconds",
-                                 "post_seconds", "min_frames",
-                                 "max_event_seconds")})
+                    # enabled/sensitivity 是本地事件侦测的真实参数（nw_events），
+                    # 过 C.normalize 钳一遍 —— 存的就是跑的；其余占位键
+                    # （预录/补录等，见 C.UNHONORED）照旧原样存，不假装生效。
+                    picked = {k: v for k, v in body["motion"].items()
+                              if k in ("enabled", "sensitivity", "detect_persons",
+                                       "pre_seconds", "post_seconds", "min_frames",
+                                       "max_event_seconds")}
+                    honored = {k: picked[k] for k in ("enabled", "sensitivity")
+                               if k in picked}
+                    cfg.setdefault("motion", {}).update(picked)
+                    if honored:
+                        cfg["motion"] = C.normalize("motion", honored,
+                                                    cfg.get("motion"))
+                    notes += C.diff_notes("motion", picked, cfg["motion"])
                 ptz_restart = False
                 if isinstance(body.get("ptz"), dict):
                     pz = dict(body["ptz"])
@@ -771,6 +1004,59 @@ class Handler(BaseHTTPRequestHandler):
         if not day:
             day = time.strftime("%Y-%m-%d")
         return _rec.segments(cam, day)
+
+    def _events_api(self, method, parts, q):
+        """本地事件侦测：时间轴事件块 + 缩略图墙。
+
+        GET  /api/events?cam=&date=YYYY-MM-DD   某路某天的事件列表
+        GET  /api/events/status                 扫描器状态（设置页显示）
+        POST /api/events/scan                   立即扫一轮（调完不等结果）
+        GET  /api/events/thumb/<cam>/th/x.jpg   事件缩略图（文件名不可枚举出内容）
+        """
+        if method == "GET" and len(parts) == 3 and parts[2] == "status":
+            mo = (C.load().get("motion") or {})
+            return self._j({"ok": True,
+                            "enabled": bool(mo.get("enabled")),
+                            "sensitivity": mo.get("sensitivity", 50),
+                            "scanner": EV.status()})
+        if method == "POST" and len(parts) == 3 and parts[2] == "scan":
+            EV.request_scan()
+            return self._j({"ok": True})
+        if method == "GET" and len(parts) >= 3 and parts[2] == "thumb":
+            return self._event_thumb(parts)
+        if method == "GET" and len(parts) == 2:
+            cam = (q.get("cam") or [""])[0]
+            if not cam or not C.get_camera(cam):
+                return self._err("缺少摄像头", 400)
+            compact = re.sub(r"[^0-9]", "", (q.get("date") or [""])[0])[:8]
+            if len(compact) != 8:
+                return self._err("日期不合法", 400)
+            return self._j({"ok": True,
+                            "events": EV.read_day(C.recordings_root(), cam, compact)})
+        return self._err("没有这个事件接口：%s" % "/".join(parts), 404)
+
+    def _event_thumb(self, parts):
+        rel = "/".join(parts[3:])
+        if not rel.endswith(".jpg") or ".." in rel.split("/"):
+            return self._send(404, b"not found", "text/plain")
+        root = os.path.realpath(os.path.join(C.recordings_root(), "events"))
+        full = os.path.realpath(os.path.join(root, *rel.split("/")))
+        if not full.startswith(root + os.sep) or not os.path.isfile(full):
+            return self._send(404, b"not found", "text/plain")
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._send(404, b"not found", "text/plain")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _onvif_api(self, method, parts):
         """ONVIF 设备发现。
@@ -1119,6 +1405,9 @@ class Handler(BaseHTTPRequestHandler):
             "record": bool(body.get("record", True)),
             "note": (body.get("note") or "")[:200],
         }
+        low = (body.get("url_low") or "").strip()
+        if low:
+            cam["url_low"] = low[:400]
         if ctype == "onvif":
             cam["onvif_host"] = (body.get("onvif_host") or "").strip()
             cam["onvif_port"] = int(body.get("onvif_port") or 80)
@@ -1133,7 +1422,7 @@ class Handler(BaseHTTPRequestHandler):
         for c in cfg["cameras"]:
             if str(c.get("id")) != str(cam.get("id")):
                 continue
-            for k in ("name", "url", "transport", "note"):
+            for k in ("name", "url", "url_low", "transport", "note"):
                 if k in body and body[k] is not None:
                     c[k] = str(body[k]).strip()[:400]
             for k in ("enabled", "record"):
@@ -1161,6 +1450,9 @@ def _public_settings(cfg):
     if nt.get("smtp_pass"):
         nt["smtp_pass_set"] = True
         nt["smtp_pass"] = ""
+    if nt.get("ding_secret"):
+        nt["ding_secret_set"] = True
+        nt["ding_secret"] = ""
     pz = dict(cfg.get("ptz") or {})
     # passToken 等价于账号密码，绝不回显
     if pz.get("token"):
@@ -1214,6 +1506,12 @@ def build_server(port, host="127.0.0.1"):
     _live = L.LiveHub(C.load)
     _rec = R.Recorder(C.load, C.recordings_root)
     _rec.start()
+    EV.start()
+    try:
+        import nw_notify as N
+        N.start_digest()
+    except Exception:
+        pass
     H.start()
     W.start()
     httpd = ThreadingHTTPServer((host, int(port)), Handler)
@@ -1230,6 +1528,12 @@ def _ensure_core():
     if _rec is None:
         _rec = R.Recorder(C.load, C.recordings_root)
         _rec.start()
+    EV.start()
+    try:
+        import nw_notify as N
+        N.start_digest()
+    except Exception:
+        pass
     H.start()
     W.start()
 
@@ -1297,6 +1601,12 @@ def build_gateway_server(sock_path):
     _live = L.LiveHub(C.load)
     _rec = R.Recorder(C.load, C.recordings_root)
     _rec.start()
+    EV.start()
+    try:
+        import nw_notify as N
+        N.start_digest()
+    except Exception:
+        pass
     H.start()
     W.start()
     parent = os.path.dirname(sock_path)

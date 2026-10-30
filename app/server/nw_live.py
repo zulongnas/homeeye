@@ -15,6 +15,13 @@
 
 TS 包固定 188 字节；SDT/PAT/PMT 由 ffmpeg 周期性重发，新订阅者从缓冲拿到
 最近的 PAT/PMT 即可让 mpegts.js 秒开。
+
+**为什么要按关键帧对齐**（1.2.0 修的花屏）：缓冲原本只管"最近 N 字节"，
+新观看端从任意位置开吃 —— 而实测主码流的 GOP 是 3.35 秒，512KB 环形缓冲
+在 8 Mbps 下只有半秒，等于**每次加入都必然落在 GOP 中间**。浏览器没有 IDR
+就硬解，画面中间糊一条绿带，直到下一个关键帧才自愈。现在环形缓冲按
+"能盖住一个 GOP"来定，并且只从最后一个 IDR 起播；慢客户端积压丢包后同样
+标记"等下个 IDR"，宁可空半秒，也不喂半截帧。
 """
 import collections
 import os
@@ -23,8 +30,76 @@ import threading
 import time
 
 TS_PACKET = 188
-# 每个订阅者保留的最近字节（约 4 秒 @ 1Mbps），足够覆盖 SPS/PPS + I 帧
-_RING = 512 * 1024
+# 环形缓冲：要盖得住一整个 GOP。按实测主码流 8 Mbps / GOP 3.35 s 算，
+# 4 MB ≈ 4 秒，够；子码流（1~2 Mbps）下是 20 秒，更够。
+_RING = 4 * 1024 * 1024
+# 单个观看端允许积压的字节（8 Mbps 下约 2 秒）。超过就整条队列作废、
+# 等下一个 IDR —— 半截帧喂给浏览器只会解出绿带。
+_MAX_BACKLOG = 2 * 1024 * 1024
+
+# H.264 的 NAL 头是低 5 位（5=IDR、7=SPS），H.265 是高 6 位（19/20=IDR、
+# 16=BLA、32/33=VPS/SPS）。参数集开头也算关键帧 —— 解码器本来就要先拿到它们。
+_H264_KEY = (5, 7)
+_HEVC_KEY = (16, 19, 20, 32, 33)
+
+
+def _keyframe_offset(batch, codec=None):
+    """返回这一批 TS 字节里「最后一个关键帧起始包」的偏移，没有就返回 -1。
+
+    codec 是这一路的视频编码（"h264"/"hevc"，未知传 None）。必须传：H.264
+    的非 IDR 切片（0x41）按 H.265 的位布局解读恰好是 VPS（32），不锁编码的话
+    每个普通帧都会被当成关键帧，对齐就完全失效了。
+
+    只认 payload_unit_start 的视频 PES 包：TS 头 → （可选）adaptation field
+    → PES 头 → Annex-B 起始码 → NAL 头。整批 32KB 约 174 个包，真正要细看的
+    只有每帧开头那几个包，代价可以忽略。
+    """
+    h264_key = codec != "hevc"
+    hevc_key = codec in (None, "hevc")
+    n = len(batch)
+    found = -1
+    i = 0
+    while i + TS_PACKET <= n:
+        if batch[i] != 0x47:
+            i += 1
+            continue
+        end = i + TS_PACKET
+        if batch[i + 1] & 0x40:                      # payload_unit_start
+            afc = (batch[i + 3] >> 4) & 0x3
+            p = i + 4
+            if afc & 0x2:                            # 有 adaptation field
+                al = batch[p] & 0x1F if p < end else 0
+                p += 1 + al
+            if p + 9 <= end and batch[p] == 0 and batch[p + 1] == 0 \
+                    and batch[p + 2] == 1 and 0xE0 <= batch[p + 3] <= 0xEF:
+                # PES 头 9 字节：stream_id 在 p+3，header_data_length 在 p+8，
+                # ES（Annex-B）从 p+9+hdl 开始 —— 差一个字节就永远找不到 IDR。
+                q = p + 9 + batch[p + 8]
+                # 一个访问单元里 IDR 前面通常还垫着 AUD/SPS/PPS，只看第一个 NAL
+                # 会全部漏掉；从 ES 开头把本包内的 NAL 都扫一遍。
+                r = q
+                while r + 4 < end:
+                    if batch[r] == 0 and batch[r + 1] == 0:
+                        if batch[r + 2] == 1:
+                            sc = 3
+                        elif batch[r + 2] == 0 and batch[r + 3] == 1:
+                            sc = 4
+                        else:
+                            r += 1
+                            continue
+                    else:
+                        r += 1
+                        continue
+                    b0 = batch[r + sc]
+                    if (h264_key and (b0 & 0x1F) in _H264_KEY) \
+                            or (hevc_key and ((b0 >> 1) & 0x3F) in _HEVC_KEY):
+                        found = i
+                        break
+                    r += sc
+        i += TS_PACKET
+    return found
+
+
 
 
 def _ffmpeg_bin():
@@ -126,25 +201,41 @@ def transcode_needed(mode, codec):
 
 
 class Subscriber(object):
-    """一个观看端：自己的字节队列（有界），避免慢客户端拖垮快客户端。"""
+    """一个观看端：自己的字节队列（有界），避免慢客户端拖垮快客户端。
 
-    __slots__ = ("q", "cv", "closed", "t0")
+    needs_key —— 这一路接下来必须先攒到一个 IDR 才能喂给浏览器。新订阅者
+    进来时、以及积压被丢弃后都会置上，两种情况原本正是绿带的来源。
+    """
 
-    def __init__(self):
+    __slots__ = ("q", "cv", "closed", "t0", "needs_key")
+
+    def __init__(self, needs_key=False):
         self.q = collections.deque()
         self.cv = threading.Condition()
         self.closed = False
         self.t0 = time.time()
+        self.needs_key = needs_key
 
-    def push(self, data):
+    def push(self, data, koff=-1):
         with self.cv:
             if self.closed:
                 return
+            if self.needs_key:
+                if koff < 0:
+                    return
+                data = data[koff:]
+                if not data:
+                    return
+                self.needs_key = False
             self.q.append(data)
-            # 有界：慢客户端积压超过上限就丢最旧的，保证实时性
             total = sum(len(x) for x in self.q)
-            while self.q and total > _RING * 2:
-                total -= len(self.q.popleft())
+            if total > _MAX_BACKLOG:
+                # 积压到这份上说明这一路已经追不上了。继续喂只会让浏览器
+                # 拿到中间断掉的一段，解出绿带；不如整条作废，等下个 IDR。
+                self.q.clear()
+                self.needs_key = True
+                self.cv.notify()
+                return
             self.cv.notify()
 
     def take(self, timeout=5.0):
@@ -192,6 +283,7 @@ class LiveCam(object):
         self._last_active = time.time()
         self._stopping = False
         self.error = ""
+        self._codec = ""
         self.started_at = 0.0
         self.frames = 0
 
@@ -228,6 +320,8 @@ class LiveCam(object):
         need, note = transcode_needed(self.tmode, codec)
         self.mode_note = note
         self.effective = "transcode" if need else "copy"
+        # 关键帧对齐要知道这条流的真实编码：转码出来必是 H.264，直拷就用探到的
+        self._codec = "h264" if need else (codec or "")
         if need:
             cmd += ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
                     "-profile:v", "main", "-pix_fmt", "yuv420p", "-crf", str(self.crf),
@@ -304,7 +398,7 @@ class LiveCam(object):
                         break
                     self.frames += 1
                     self._latest = time.time()
-                    self._feed(batch)
+                    self._feed(batch, _keyframe_offset(batch, self._codec))
         except Exception as e:
             self.error = "read: %s" % e
         finally:
@@ -316,22 +410,35 @@ class LiveCam(object):
                 if self._proc is proc:
                     self._proc = None
 
-    def _feed(self, batch):
-        """把一批 TS 字节写进环形缓冲并广播给所有订阅者。"""
+    def _feed(self, batch, koff=-1):
+        """把一批 TS 字节写进环形缓冲并广播给所有订阅者。
+
+        koff 是这批里最后一个关键帧起始包的偏移（没有则 -1），环形缓冲要记住它，
+        新订阅者才知道该从哪里开始喂浏览器。
+        """
         with self._lock:
-            self._ring.append(batch)
+            self._ring.append((batch, koff))
             self._ring_len += len(batch)
             while self._ring_len > _RING:
-                self._ring_len -= len(self._ring.popleft())
+                self._ring_len -= len(self._ring.popleft()[0])
             subs = list(self._subs)
         for s in subs:
-            s.push(batch)
+            s.push(batch, koff)
 
     def _recent(self):
-        """返回最近一段 TS 缓冲（新订阅者秒开用），并重置其读取进度。"""
+        """新订阅者的秒开数据：环形缓冲里「最后一个 IDR 之后」的那一段。
+
+        返回 (字节, 是否从关键帧对齐)。缓冲里还没有关键帧（GOP 比缓冲还长）时
+        返回空，让订阅者挂 needs_key 等下一个 IDR，也不要把半截 GOP 喂进去。
+        """
         with self._lock:
-            data = b"".join(self._ring)
-        return data
+            ring = list(self._ring)
+        for idx in range(len(ring) - 1, -1, -1):
+            batch, koff = ring[idx]
+            if koff >= 0:
+                parts = [batch[koff:]] + [b for b, _k in ring[idx + 1:]]
+                return b"".join(parts), True
+        return b"", False
 
     def _stop_proc(self):
         with self._lock:
@@ -357,14 +464,16 @@ class LiveCam(object):
 
     def add_sub(self):
         with self._lock:
-            s = Subscriber()
+            need = self._proc is None or self._proc.poll() is not None
+            # 缓冲里没有 IDR 就先挂着等：宁可让浏览器晚半秒出画面，
+            # 也不要从 GOP 中间开吃 —— 那正是那条绿带。
+            recent, aligned = self._recent()
+            s = Subscriber(needs_key=not aligned)
             self._subs.append(s)
             self._last_active = time.time()
-            need = self._proc is None or self._proc.poll() is not None
-            recent = self._recent()
-        # 新订阅者先把最近一段缓冲吃进去（含 PAT/PMT/SPS/PPS/I 帧），秒开
+        # 新订阅者先把「最后一个 IDR 之后」这段吃进去（含 PAT/PMT/SPS/PPS/I 帧），秒开
         if recent:
-            s.push(recent)
+            s.push(recent, 0)
         if need:
             self._spawn()
         return s
@@ -409,30 +518,41 @@ class LiveHub(object):
         cfg = self._cfg()
         return cfg.get("live") or {}
 
-    def get(self, cam):
+    def get(self, cam, tier="high"):
+        """取一路直播。tier="low" 用摄像头配置里的子码流地址（url_low），
+        没配就回落主码流 —— 网格里 4/9 宫格没必要每格都拉 8 Mbps 主码流。"""
         cid = str(cam.get("id"))
+        low = (tier == "low")
+        url = (cam.get("url_low") or "").strip() if low else (cam.get("url") or "")
+        if not url:
+            url = cam.get("url") or ""
+        key = ("%s#low" % cid) if low and (cam.get("url_low") or "").strip() else cid
         opts = self._opts()
         with self._lock:
-            lc = self._cams.get(cid)
+            lc = self._cams.get(key)
             # 参数或地址变了就重建（改完设置不用重启应用）
-            sig = (cam.get("url"), cam.get("transport"),
+            sig = (url, cam.get("transport"),
                    _tmode(opts.get("transcode")), bool(opts.get("audio", True)),
                    int(opts.get("width") or 0), int(opts.get("fps") or 0),
                    int(opts.get("quality") or 23))
             if lc is None or getattr(lc, "_sig", None) != sig:
                 if lc is not None:
                     lc._stop_proc()
-                lc = LiveCam(cam, opts)
+                cam2 = dict(cam)
+                cam2["url"] = url
+                lc = LiveCam(cam2, opts)
                 lc._sig = sig
-                self._cams[cid] = lc
+                self._cams[key] = lc
             self._ensure_janitor()
             return lc
 
     def drop(self, cam_id):
         with self._lock:
             lc = self._cams.pop(str(cam_id), None)
-        if lc:
-            lc._stop_proc()
+            lc_low = self._cams.pop("%s#low" % cam_id, None)
+        for x in (lc, lc_low):
+            if x:
+                x._stop_proc()
 
     def drop_all(self):
         with self._lock:

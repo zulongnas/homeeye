@@ -89,22 +89,66 @@ pip3 install aiohttp aiofiles requests cryptography av numpy \
 | 能力 | 状态 | 备注 |
 |---|---|---|
 | 多分屏实时画面（1/2/4/6/9） | ✅ | 单击放大、双击全屏 |
+| 双码流（主 / 子） | ✅ | 多分屏小窗口自动走子码流，省带宽也省 CPU；单屏仍取主码流 |
 | 按需转码 | ✅ | `live.transcode = auto/always/never`；源已 H.264 就 `-c:v copy` |
 | 连续录像 + 按日时间轴回放 | ✅ | 分段 MP4，断电重启不会出现索引与文件对不上 |
+| 事件时间轴 | ✅ | 分段写完后本地离线侦测动静，时间轴上标事件块，点一下跳到那一刻 |
 | 录像源可选 PLAYED / RAW | ✅ | 录原始流省一半体积 |
-| 保留天数 / 容量上限自动清理 | ✅ | 两个都填时**同时生效**，任一命中就删 |
-| 移动侦测 | ✅ | 用摄像头自己上报的设备事件，不自己分析画面 |
+| 保留天数 / 容量上限自动清理 | ✅ | 两个都填时**同时生效**，任一命中就删；被事件引用的分段留到最后 |
+| 移动侦测 | ✅ | 本机离线侦测（只解关键帧，不与录像/直播抢资源）+ 摄像头自报事件 |
 | 断网空洞由 SD 卡回补 | ✅ | 摄像头侧兜底，回补后与本地分段合并 |
 | 看门狗：断链重建 / IP 漂移自愈 / 退避 | ✅ | 摄像头被拔电只记流水、不告警、不让容器变红 |
 | 云台（PTZ） | ⚠️ 机型相关 | 小米走 `miss` 私有命令；ONVIF 机型走标准 Profile T |
 | 语音对讲 | ⚠️ 机型相关 | **必须 HTTPS**（浏览器麦克风的规矩，不是本项目的限制） |
-| 邮件告警 | ✅ | SMTP；未配置就只记日志，不会静默失败 |
+| 通知：邮件 / 企业微信 / 钉钉 / Bark / Webhook | ✅ | 多渠道可同时开；支持布防时段与每日日报；未配置就只记日志，不会静默失败 |
+| 监控接入 `GET /api/metrics` | ✅ | Prometheus 文本格式 0.0.4，可选 `HE_METRICS_TOKEN` 只读令牌 |
 | 米家扫码授权批量加摄像头 | ⚠️ 需自取 SDK | 见 NOTICE.md 第三节 |
 
 实测过的机型：创米 `chuangmi.camera.039a01`、`chuangmi.camera.069a01`、
 `madv.cateye.miowlv2`（都是小米生态），以及若干标准 RTSP 摄像头。
 **没在这三份样本上验证过的机型不保证可用**，尤其是云台与对讲 ——
 它们的差异全在 `miss` 私有命令的实现细节里。
+
+## 监控接入（Prometheus / Grafana）
+
+`GET /api/metrics` 输出 Prometheus 文本格式（`text/plain; version=0.0.4`）。
+抓取器不是浏览器，拿不到登录会话，所以给它发一个只读令牌：
+
+```sh
+# docker/.env
+HE_METRICS_TOKEN=<openssl rand -hex 24 的输出>
+# 改完 docker compose up -d
+curl -s "http://127.0.0.1:8088/api/metrics?token=$HE_METRICS_TOKEN" | head
+```
+
+`prometheus.yml`：
+
+```yaml
+scrape_configs:
+  - job_name: homeeye
+    scrape_interval: 30s
+    metrics_path: /api/metrics
+    static_configs:
+      - targets: ["127.0.0.1:8088"]      # NAS 上直连；跨机就写 NAS 的地址
+    # 令牌也可以走 Authorization 头，二选一
+    # authorization:
+    #   credentials: <HE_METRICS_TOKEN>
+```
+
+指标族：`homeeye_up` / `homeeye_info` / `homeeye_uptime_seconds` /
+`homeeye_process_rss_bytes`、每路 `homeeye_camera_up` / `homeeye_camera_state` /
+`homeeye_recording_up` / `homeeye_camera_segment_age_seconds` /
+`homeeye_events_today`、`homeeye_live_frames_total` / `homeeye_live_subscribers`、
+`homeeye_storage_ok` / `_free_bytes` / `_disk_total_bytes` / `_budget_bytes`、
+`homeeye_recordings_bytes`、`homeeye_scanner_beat_age_seconds` /
+`homeeye_scanner_pending`、`homeeye_watchdog_beat_age_seconds` /
+`homeeye_watchdog_loops_total` / `homeeye_watchdog_actions_total{action}`。
+
+- 没设 `HE_METRICS_TOKEN` 时，这个接口和其它 API 一样要登录会话 —— **默认不多开一个口子**。
+- 令牌只放行 `/api/metrics` 这一个路径，别拿它当登录口令用。
+- 每次抓取读的是内存里的状态快照，不会触发链路探测；整段结果缓存 5 秒，
+  多个抓取器不会把 NAS 的目录遍历放大成负载。
+- 不想让局域网随便抓：令牌本身就是门槛；再严一点就在反向代理上按来源 IP 限制。
 
 ## 安全模型
 
@@ -177,14 +221,17 @@ sh tools/pack-fpk.sh                  # 出 homeeye.fpk（名字来自 manifest 
 ```
 
 发布包的实测记录（构建、起容器、零配置首启、认领窗口、fpk 出包各自跑成什么样、
-哪些没跑）在 `docs/DEPLOY.md` 第七节。
+哪些没跑）在 `docs/DEPLOY.md` 第八节。
 
 ## 已知限制
 
 - 对讲上行是 HTTP 分块推给 go2rtc，不是 WebRTC：延迟约 120 ms 一批，
   够用但不如原生 WebRTC 顺滑。改 WebRTC 需要 go2rtc 侧先有 WHIP 服务端
   （上游 `internal/webrtc/server.go` 里那条 PATCH 还是 `TODO`）。
-- 移动侦测依赖摄像头自己上报事件；不会分析画面的纯 RTSP 摄像头没有事件流。
+- 事件侦测是**离线后处理**：分段写完（默认 5 分钟切片）后几分钟内才标出来，
+  不是秒级告警；要更快的实时提醒，靠摄像头自己上报的设备事件。
+- 事件侦测只解关键帧做像素差分，判断"有没有动静"，**不区分人/车/宠物** ——
+  分类要模型，见 [docs/ROADMAP.md](docs/ROADMAP.md) 的 1.3 计划。
 - 云台/对讲机型相关，见上表。
 - 没有用户体系：一个密码管全部。要多人分级请放在反向代理后面。
 - SD 卡回补要求摄像头自己开了录像且时间戳可信。

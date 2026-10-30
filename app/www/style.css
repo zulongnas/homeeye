@@ -310,12 +310,40 @@ body.fs-on { overflow: hidden; }
 .tl-blocks { position: absolute; inset: 0; }
 .tl-blk { position: absolute; top: 0; bottom: 0; background: rgba(240,180,41,.55); }
 .tl-blk:hover { background: rgba(240,180,41,.8); }
+/* 事件层：盖在录像块上面的红色顶条，容器不拦点击（空白处仍是"跳转到此处"） */
+.tl-events { position: absolute; inset: 0; pointer-events: none; }
+.tl-ev {
+  position: absolute; top: 0; height: 6px; min-width: 5px;
+  background: linear-gradient(180deg, #ff5b4a, rgba(255,91,74,.25));
+  border-radius: 0 0 3px 3px;
+  box-shadow: 0 0 5px rgba(255,91,74,.8);
+  cursor: pointer; pointer-events: auto;
+}
+.tl-ev:hover { height: 100%; background: rgba(255,91,74,.3); }
 .tl-head {
   position: absolute; top: 0; bottom: 0; width: 2px;
   background: #ff5b4a; box-shadow: 0 0 6px rgba(255,91,74,.9);
   left: 0; display: none;
 }
 .tl-hint { flex: 0 0 auto; color: #61717f; font-size: 11.5px; padding-top: 6px; }
+
+/* 事件缩略图墙：当天每条事件一张截屏，横向滚动 */
+.ev-strip {
+  flex: 0 0 auto; margin-top: 8px;
+  display: flex; gap: 8px; overflow-x: auto;
+  padding: 6px 2px 2px;
+}
+.ev-card {
+  flex: 0 0 auto; width: 96px;
+  border: 1px solid var(--line-soft); border-radius: 8px;
+  overflow: hidden; cursor: pointer; background: #0e1620;
+}
+.ev-card img { display: block; width: 100%; height: 54px; object-fit: cover; }
+.ev-card .ev-t {
+  display: block; font-size: 10.5px; color: #9fb0c0;
+  text-align: center; padding: 3px 0;
+}
+.ev-card:hover { border-color: #ff5b4a; }
 
 /* ---------------------------------------------------------------- 设置卡片 */
 /* 设置页：左导航 + 右内容，右侧纵向一列上下滚 */

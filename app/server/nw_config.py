@@ -33,7 +33,7 @@ DEFAULT = {
         "budget_gb": 0,             # >0 时按总容量上限滚动删除
         "record_mode": "continuous",  # continuous 全时 | off 不录（motion 没实现，见 UNHONORED）
         "record_audio": True,       # 录像是否带音频
-        "keep_events_days": 30,     # 未生效：没有事件录像这个东西
+        "keep_events_days": 30,     # 事件明细/缩略图保留天数（1.2.0-D 起 nw_events 生效）
         "source": "PLAYED",         # 录哪一路：PLAYED=转码后的流 / RAW=摄像头原始流
     },
     "live": {
@@ -46,17 +46,17 @@ DEFAULT = {
         "autoplay": True,           # 打开页面自动播放
         "audio": True,              # 实时画面是否取音频（关掉可省 CPU/带宽）
     },
-    # 侦测本身在摄像头里跑（见 nw_motion：设置页那面直接读写设备）。这一组是
-    # HomeEye 侧"自己分析画面"才会用到的参数，那条路没实现，所以整组不生效；
-    # 值照存，将来真要做本地分析时不用迁移配置。
+    # 事件侦测有两条来源：设备侧（小米等，见 nw_motion，直接读写摄像头）和
+    # HomeEye 本地分析（1.2.0-C 起，见 nw_events：对写完的分段做关键帧级
+    # 画面差分，给回放页时间轴标事件块）。enabled/sensitivity 只管本地分析。
     "motion": {
-        "enabled": False,           # 已由设备侧每路开关取代，这里的全局值不参与判定
-        "sensitivity": 50,          # 同上；设备只有低/高两档，1~100 无处映射
-        "detect_persons": True,     # 人形检测（优先，退化到通用运动）
-        "pre_seconds": 3,           # 事件前预录秒数
-        "post_seconds": 10,         # 事件后补录秒数
-        "min_frames": 3,            # 连续多少帧变化才算事件
-        "max_event_seconds": 120,   # 单个事件最长时长
+        "enabled": False,           # 本地事件侦测总开关（关 = 不扫分段、时间轴无事件块）
+        "sensitivity": 50,          # 1~100，越高越灵敏（=像素差阈值越低）
+        "detect_persons": True,     # 人形检测（优先，退化到通用运动）—— 占位，见 UNHONORED
+        "pre_seconds": 3,           # 事件前预录秒数 —— 占位（record_mode 无事件式）
+        "post_seconds": 10,         # 事件后补录秒数 —— 占位
+        "min_frames": 3,            # 连续多少帧变化才算事件 —— 占位
+        "max_event_seconds": 120,   # 单个事件最长时长 —— 占位
     },
     # 说明：九宫格与铺满方式（旧 1.0.x 的 "ui" 组）不在这里 —— 那是**这台浏览器**
     # 的看片偏好，不是这台摄像头的属性，存服务端会让手机和电脑互相冲掉。
@@ -76,6 +76,16 @@ DEFAULT = {
         "dnd_enabled": False,       # 免打扰
         "dnd_start": "22:00",
         "dnd_end": "08:00",
+        # 1.2.0-D：多渠道 + 布防撤防 + 日报（配了哪个渠道就走哪个）
+        "wecom_webhook": "",        # 企业微信群机器人 Webhook 地址
+        "ding_webhook": "",         # 钉钉群机器人 Webhook 地址
+        "ding_secret": "",          # 钉钉机器人加签密钥（可空）
+        "bark_url": "",             # Bark 推送地址（https://api.day.app/<key>）
+        "webhook_url": "",          # 通用 Webhook（POST JSON: title/text/time）
+        "arming_mode": "always",    # always 全天布防 | sched 按时段 | off 撤防
+        "arming_ranges": "",        # 布防时段："22:00-08:00,12:00-14:00"
+        "digest_enabled": False,    # 每日日报
+        "digest_hour": 20,          # 日报发送小时（0-23）
     },
     # 看门狗：管心跳（巡检/录像循环停转就补线程），也管自愈（断链重建、IP 漂移）。
     # 冷却与"最多修几次"是这一层的刹车 —— 没有它，一条真坏掉的链路会被无限重试，
@@ -160,6 +170,22 @@ RULES = {
         "dnd_start": ("hms",),
         "dnd_end": ("hms",),
         "to_addrs": ("text",),
+        # 1.2.0-D 多渠道 + 布防撤防 + 日报
+        "wecom_webhook": ("text",),
+        "ding_webhook": ("text",),
+        "ding_secret": ("text",),
+        "bark_url": ("text",),
+        "webhook_url": ("text",),
+        "arming_mode": ("choice", ("always", "sched", "off")),
+        "arming_ranges": ("text",),
+        "digest_enabled": ("bool",),
+        "digest_hour": ("int", 0, 23),
+    },
+    # 本地事件侦测（1.2.0-C 起）：事件时间轴上的事件块就是它跑出来的。
+    # 剩下的占位键（预录/补录等）见 UNHONORED。
+    "motion": {
+        "enabled": ("bool",),
+        "sensitivity": ("int", 1, 100),
     },
     "auth": {
         "enabled": ("bool",),
@@ -185,20 +211,13 @@ UNHONORED = {
     "motion": {
         "keys": ("detect_persons", "pre_seconds", "post_seconds",
                  "min_frames", "max_event_seconds"),
-        "why": "HomeEye 不做本地画面分析：移动侦测由摄像头自己判（设置页上面那面"
-               "读写的就是设备上的开关与档位），SDK 也不把事件推给 HomeEye，"
-               "所以「事件前预录/后补录/最小帧数」这些分层参数没有东西可以套。",
+        "why": "本地事件侦测（时间轴上的事件块）已经真的在跑，用的是上面的"
+               "「启用」与「灵敏度」两个格子。剩下的预录/补录/最小帧数是给"
+               "「事件式录像」准备的，而 record_mode 只有全时/不录两档 —— "
+               "全时录像里不存在'事件前后'，这些分层参数没有东西可以套。",
     },
-    "storage": {
-        "keys": ("keep_events_days",),
-        "why": "事件录像并不存在（record_mode 只有全时/不录两档），"
-               "所以这个天数没有东西可保留。",
-    },
-    "notify": {
-        "keys": ("on_motion",),
-        "why": "设备判出的移动事件不会推给 HomeEye（米家 SDK 没有事件订阅通道），"
-               "所以这里没有可发不发的通知。",
-    },
+    # storage.keep_events_days 已转正（1.2.0-D）：事件明细与缩略图只保留这么多天；
+    # notify.on_motion 已转正：本地事件扫出动静会真的发通知（布防时段内）。
 }
 
 

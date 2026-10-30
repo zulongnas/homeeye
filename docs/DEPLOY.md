@@ -22,7 +22,7 @@ curl -s http://127.0.0.1:8088/api/health | head -c 300
 
 | 镜像 | 是什么 | 备注 |
 |---|---|---|
-| `ghcr.io/zulongnas/homeeye:1.1.4` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
+| `ghcr.io/zulongnas/homeeye:1.2.0` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
 | `ghcr.io/zulongnas/homeeye-go2rtc-ptz:1.9.15` | go2rtc 官方 `master-hardware` + 云台/对讲补丁 | tag 是 go2rtc 的上游版本（它只在换上游时变）；换回 `alexxit/go2rtc:master-hardware` 也能拉流硬转 |
 
 要改代码、要小米 SDK、或者不想用别人构建的镜像，就用本地构建（镜像名不变，
@@ -181,9 +181,41 @@ cd docker && docker compose pull && docker compose up -d   # 换新镜像，data
 `always/never`（升级不改行为）。回滚 = 换回旧 tag 的镜像再起一次；
 `data/` 不需要动，也没有数据库迁移。新版镜像在
 [Releases](https://github.com/zulongnas/homeeye/releases) 里能找到对应版本号
-（tag 就是镜像 tag，例如 `1.1.4`）。
+（tag 就是镜像 tag，例如 `1.2.0`）。
 
-## 七、发布包实测记录（2026-10-30）
+## 七、监控接入（Prometheus / Grafana）
+
+`GET /api/metrics` 是 Prometheus 文本格式（0.0.4）的只读快照。抓取器没有浏览器
+会话，所以给它一个令牌：
+
+```sh
+# docker/.env
+HE_METRICS_TOKEN=$(openssl rand -hex 24)
+docker compose up -d          # 让环境变量进容器
+curl -s "http://127.0.0.1:8088/api/metrics?token=$HE_METRICS_TOKEN" | head
+# 也可以走请求头：Authorization: Bearer <token>
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: homeeye
+    scrape_interval: 30s
+    metrics_path: /api/metrics
+    static_configs:
+      - targets: ["127.0.0.1:8088"]
+    authorization:
+      credentials: <HE_METRICS_TOKEN>
+```
+
+- 没设 `HE_METRICS_TOKEN` → 这个接口和其它 API 一样要登录会话，默认不多开口子。
+- 令牌只放行 `/api/metrics`；不要拿它当登录口令，也不要用它去调别的接口。
+- 抓取读的是内存快照，不触发链路探测；整段结果缓存 5 秒，多抓取器不会放大负载。
+- 指标族与字段含义见 [README 的「监控接入」](../README.md#监控接入prometheus--grafana)。
+- fpk 安装方式：在应用中心的「配置」里给 `HE_METRICS_TOKEN` 环境变量（或直接在
+  `cmd` 启动脚本的 `export` 里加），效果与 Docker `.env` 相同。
+
+## 八、发布包实测记录（2026-10-30）
 
 这节只写"跑过的"，跑完没验证的东西写在最后的「没验证」里。文档其它地方的说法以这节为准。
 
@@ -220,6 +252,21 @@ cd docker && docker compose pull && docker compose up -d   # 换新镜像，data
 镜像由仓库的 `.github/workflows/ghcr.yml` 手动触发构建（`permissions: packages: write`，
 用仓库自带 `GITHUB_TOKEN`，不需要任何个人令牌）。本体按 HomeEye 版本打 tag，
 云台版 go2rtc 按上游版本打 tag（`1.9.15`）。
+
+**1.2.0（事件时间轴 / 通知联动 / Prometheus 指标）复核，2026-10-31：**
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 本地逻辑回归 | `_verify_events.py` / `_verify_notify.py` / `_verify_metrics.py` | 全过；指标套件 38/38（令牌矩阵、`?token=`、标签转义、HELP/TYPE 配对、行格式） |
+| 容器内 HTTP 回归 | 三套脚本在 `homeeye` 容器里各起一次性实例（隔离数据目录） | 事件 9/9、通知 17/17、指标全过（含网关前缀路径与 HEAD） |
+| 生产抓取（真机） | 真实 NAS 容器 + `.env` 里的 `HE_METRICS_TOKEN` | 200；`text/plain; version=0.0.4`；23/23 项通过；无令牌/错令牌 401；5 秒内快照一致、6 秒后 `uptime` 增长 |
+| 扫描器心跳 | 生产 `/api/metrics` 的 `homeeye_scanner_beat_age_seconds` | 3.08 秒（正在扫真实录像目录），`events_today` 按路输出 |
+| 分屏切换 | 浏览器点 1/2/4/6/9 | 画面数 1/2/4/6/9 全部正确（修掉"点 4 及以后都只显示 2 个"） |
+| 事件时间轴 | 本地一次性实例（假分段 + 假事件） | 4 个录像块 + 6 个事件标记 + 6 张事件卡，点标记跳转 |
+| 设置页 | 通知多渠道 / 布防 / 日报 / 事件保留 | 全部渲染、保存回环成功；未生效项只剩移动侦测的分层参数 |
+
+1.2.0-A（按 IDR 起播修绿带）与 1.2.0-B（双码流）在开发阶段已在真机主/子码流上
+验证过；本次回归没有再采样画面，只确认这两块的代码路径没被后续改动碰到。
 
 ### 没验证的（别照着这些吹）
 
