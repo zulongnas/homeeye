@@ -13,9 +13,23 @@
 ```sh
 git clone https://github.com/zulongnas/homeeye.git homeeye && cd homeeye/docker
 cp .env.example .env          # 选存放路径；直接回车不改也能跑（用仓库下的 data/ 与 rec/）
-docker compose up -d --build
+docker compose up -d          # 镜像从 ghcr.io 拉（公开，免登录）
 docker compose ps
 curl -s http://127.0.0.1:8088/api/health | head -c 300
+```
+
+两个镜像：
+
+| 镜像 | 是什么 | 备注 |
+|---|---|---|
+| `ghcr.io/zulongnas/homeeye:1.1.3` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
+| `ghcr.io/zulongnas/homeeye-go2rtc-ptz:1.9.15` | go2rtc 官方 `master-hardware` + 云台/对讲补丁 | tag 是 go2rtc 的上游版本（它只在换上游时变）；换回 `alexxit/go2rtc:master-hardware` 也能拉流硬转 |
+
+要改代码、要小米 SDK、或者不想用别人构建的镜像，就用本地构建（镜像名不变，
+本地镜像优先于远端同名镜像）：
+
+```sh
+docker compose build          # 或 up -d --build
 ```
 
 浏览器打开 `http://<这台机器的IP>:8088` → 设登录密码 → 设置 → 摄像头 → 添加。
@@ -62,6 +76,8 @@ go2rtc/go2rtc.yaml              go2rtc 的配置（只有用小米/硬转才需�
   docker compose build --build-arg HE_WITH_MILOCO_SDK=1 homeeye
   docker compose up -d --force-recreate homeeye
   ```
+  （构建出来的镜像名和公开镜像相同，只是本地这份多带 SDK；`docker compose images`
+  能看到用的是哪个 ID。公开镜像是故意不带 SDK 的。）
 - **其他流**：任何 ffmpeg 认的地址（HTTP-FLV、RTMP、`pipe:` 之类）。
 
 ### 想省 CPU / 省带宽：让 go2rtc 做一次硬转
@@ -127,7 +143,7 @@ server {
 | 对讲按下去没反应 | 页面不是安全上下文（用 http://内网IP 打开）→ 见第四节 |
 | 录像目录写不进去 | 健康检查会报 broken；确认挂载与目录属主（容器里是 root，飞牛 fpk 版是 `homeeye` 账号） |
 | 摄像头被拔电后容器变红 | 不该发生。offline 只记流水；变红说明是 broken，看 `/api/health` 的 per-cam reason |
-| 云台转不动（小米） | 需要定制版 go2rtc：`sh tools/build-go2rtc-ptz.sh`，然后换 compose 里的 image |
+| 云台转不动（小米） | 先确认 go2rtc 用的是 `homeeye-go2rtc-ptz`（`docker inspect go2rtc --format '{{.Config.Image}}'`）；`/api/xiaomi/ptz` 404 说明在跑官方镜像 |
 
 看健康检查（免登录，只回结论）：
 
@@ -158,12 +174,14 @@ argv，同机器上任何用户 `ps` 一看就到眼。上面 `read -s` + 临时
 
 ```sh
 git pull
-cd docker && docker compose up -d --build          # 镜像重建，data/ 不动
+cd docker && docker compose pull && docker compose up -d   # 换新镜像，data/ 不动
 ```
 
 配置格式向后兼容：老配置里的 `live.transcode: true/false` 会自动翻成
 `always/never`（升级不改行为）。回滚 = 换回旧 tag 的镜像再起一次；
-`data/` 不需要动，也没有数据库迁移。
+`data/` 不需要动，也没有数据库迁移。新版镜像在
+[Releases](https://github.com/zulongnas/homeeye/releases) 里能找到对应版本号
+（tag 就是镜像 tag，例如 `1.1.3`）。
 
 ## 七、发布包实测记录（2026-10-30）
 

@@ -1,8 +1,11 @@
 # HomeEye · 开箱部署（docker compose）
 #
 #   cp .env.example .env && vi .env          先选存放路径（不改就用默认，也跑得起来）
-#   docker compose up -d --build             构建并启动
+#   docker compose up -d                     拉预构建镜像并启动（ghcr.io，公开，免登录）
 #   浏览器打开 http://<这台机器的IP>:8088  —— 第一件事是设登录密码（认领这台 NVR）
+#
+# 要自己编（改代码 / 要小米 SDK）就把上面那条换成 up -d --build：镜像名不变，
+# 本地构建会覆盖同名的本地镜像，容器用哪一份可以用 docker compose images 确认。
 #
 # 装完是**零配置**：没有摄像头、没有米家账号、没有录像。摄像头要你在设置页里
 # 自己加，凭据只落在你自己的 data/ 目录里（见 .gitignore，别把它提交到任何地方）。
@@ -29,11 +32,12 @@
 services:
 
   go2rtc:
-    # 官方镜像就够跑通「拉流 + 硬件转码」。
-    # 只有小米云台控制与语音对讲需要打过补丁的版本（见 third_party/go2rtc-ptz/）：
-    #   sh tools/build-go2rtc-ptz.sh     # 产出 homeeye/go2rtc:1.1.3-ptz
-    #   然后把下面的 image 换成它。
-    image: alexxit/go2rtc:master-hardware
+    # 预构建版：官方 master-hardware 的基础层 + 打了 HomeEye 补丁的二进制
+    # （小米云台控制、语音对讲走 Mi Home 的私有命令，官方版没有这两个接口）。
+    # 补丁源码在 third_party/go2rtc-ptz/（go2rtc 是 MIT，改动已披露）。
+    # 只想要官方原版就换回 alexxit/go2rtc:master-hardware（云台/对讲会消失）；
+    # 想自己编就 sh tools/build-go2rtc-ptz.sh，再把下面这行换成它的输出镜像。
+    image: ghcr.io/zulongnas/homeeye-go2rtc-ptz:1.9.15
     container_name: go2rtc
     restart: unless-stopped
     network_mode: host
@@ -49,13 +53,14 @@ services:
     # homeeye 的 /api/health 会去探 go2rtc 的接口，链路断了在那里就能看见。
 
   homeeye:
+    # 预构建镜像（公开，免登录）。--build 会用它上面的 build 段本地构建同一名字。
     build:
       context: ..
       dockerfile: docker/Dockerfile
       # 需要小米摄像头：先 sh tools/fetch-miloco-sdk.sh，再放开这两行。
       # args:
       #   HE_WITH_MILOCO_SDK: "1"
-    image: homeeye:1.1.3
+    image: ghcr.io/zulongnas/homeeye:1.1.3
     container_name: homeeye
     restart: unless-stopped
     network_mode: host

@@ -2,7 +2,10 @@
 # 构建 HomeEye 定制版 go2rtc 镜像 + 云台侧车 heptz。
 #
 #   sh tools/build-go2rtc-ptz.sh
-#   TAG=homeeye/go2rtc:1.1.3-ptz sh tools/build-go2rtc-ptz.sh
+#   TAG=homeeye/go2rtc:test sh tools/build-go2rtc-ptz.sh
+#
+# 默认 TAG 就是 docker-compose 里引用的那个 ghcr 名字：本地编完直接 up -d 就会用上
+# 本地这份（同名镜像本地优先于远端），不用改 compose。
 #
 # 为什么要有这个脚本：小米云台控制与语音对讲走 Mi Home 的 miss 私有命令，官方
 # go2rtc 不开放，所以我们在 upstream v1.9.15 上打了 15 个文件的补丁。补丁文件
@@ -21,7 +24,7 @@ VER="${VER:-v1.9.15}"
 # upstream tarball 的 sha256（2026-10-29 取自 codeload 的 refs/tags/v1.9.15）。
 # 上游如果重新打 tag，这里会当场报错而不是悄悄编出别的东西 —— 那正是要的效果。
 UPSTREAM_SHA256="${UPSTREAM_SHA256:-08901ecc03ec031b1af13268e6e62370ba7f887b30f98866624d683e0486c084}"
-TAG="${TAG:-homeeye/go2rtc:1.1.3-ptz}"
+TAG="${TAG:-ghcr.io/zulongnas/homeeye-go2rtc-ptz:${VER#v}}"
 BASE="${BASE:-alexxit/go2rtc:master-hardware}"
 GOIMG="${GOIMG:-golang:1.26-alpine}"
 GOPROXY_="${GOPROXY:-https://goproxy.cn,direct}"
@@ -119,6 +122,6 @@ fi
 
 echo ""
 echo "OK: $TAG / heptz 已冒烟通过"
-echo "下一步：把 docker/docker-compose.yml 里 go2rtc 的 image 改成 $TAG，"
-echo "         然后 cd docker && docker compose up -d --force-recreate go2rtc"
+echo "下一步：cd docker && docker compose up -d --force-recreate go2rtc"
+echo "         （compose 里引用的就是这个镜像名，本地这份优先生效）"
 echo "源码与逐条补丁说明见 third_party/go2rtc-ptz/（go2rtc 是 MIT，改动已在此披露）。"

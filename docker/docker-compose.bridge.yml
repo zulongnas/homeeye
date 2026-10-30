@@ -3,8 +3,9 @@
 # 默认那份 docker-compose.yml 用 host 网络，Docker Desktop 上没有可用的 host 网络，
 # 所以这里给一份显式发布端口的版本：
 #
-#   cd docker && docker compose -f docker-compose.bridge.yml up -d --build
+#   cd docker && docker compose -f docker-compose.bridge.yml up -d
 #   浏览器打开 http://127.0.0.1:8088
+#   （镜像来自 ghcr.io，公开免登录；要本地构建就加 --build）
 #
 # 换来换去少掉的能力（都是网络性质决定的，不是 bug）：
 #   * 小米摄像头取流：P2P 打洞要 UDP 广播，NAT 后面会 PPCS_Connect errorcode: -3
@@ -18,7 +19,7 @@
 services:
 
   go2rtc:
-    image: alexxit/go2rtc:master-hardware
+    image: ghcr.io/zulongnas/homeeye-go2rtc-ptz:1.9.15
     container_name: go2rtc
     restart: unless-stopped
     environment:
@@ -39,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: homeeye:1.1.3
+    image: ghcr.io/zulongnas/homeeye:1.1.3
     container_name: homeeye
     restart: unless-stopped
     depends_on:

@@ -6,8 +6,11 @@
 # 仓库自带的 GITHUB_TOKEN 带上 packages: write 就能推，不需要任何额外令牌。
 #
 # 手动触发一次，产出两个镜像：
-#   ghcr.io/<owner>/homeeye:<version>            本体（HE_WITH_MILOCO_SDK=0，不夹带小米 SDK）
-#   ghcr.io/<owner>/homeeye-go2rtc-ptz:<version> 打了云台/对讲补丁的 go2rtc
+#   ghcr.io/<owner>/homeeye:<version>                  本体（HE_WITH_MILOCO_SDK=0，不夹带小米 SDK）
+#   ghcr.io/<owner>/homeeye-go2rtc-ptz:<go2rtc 上游版本> 打了云台/对讲补丁的 go2rtc
+#
+# 两套 tag 规则是有意的：本体按 HomeEye 版本走，go2rtc 那份只跟着上游变，
+# 所以它的 tag 是 1.9.15 这种上游版本号，而不是 HomeEye 的版本号。
 #
 # 镜像默认是 private。要让别人直接 docker pull，去
 # GitHub → 个人头像 → Your packages → 对应 package → Package settings → Change visibility
@@ -92,10 +95,12 @@ jobs:
       - name: 取上游 + 打补丁 + 编译 + 冒烟 + 出镜像
         env:
           VER: ${{ inputs.go2rtc_version }}
-          TAG: ghcr.io/${{ github.repository }}-go2rtc-ptz:${{ inputs.version }}
           GOPROXY: https://proxy.golang.org,direct
         run: |
           set -eu
+          # tag 用上游版本号（去掉前缀 v）：这份镜像只在 go2rtc 换版本时才变
+          TAG="$G2R_IMAGE:${VER#v}"
+          export TAG
           sh tools/build-go2rtc-ptz.sh
           docker tag "$TAG" "$G2R_IMAGE:latest"
           docker push "$TAG"

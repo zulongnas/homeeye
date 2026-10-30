@@ -24,7 +24,7 @@
 git clone https://github.com/zulongnas/homeeye.git && cd homeeye
 cd docker
 cp .env.example .env          # 只问一件事：配置和录像各放哪个目录（不改也能跑）
-docker compose up -d --build
+docker compose up -d          # 镜像从 ghcr.io 拉，公开免登录，不用先构建
 # 浏览器打开 http://<这台机器的IP>:8088
 ```
 
