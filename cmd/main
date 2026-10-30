@@ -1,0 +1,154 @@
+#!/bin/bash
+# ============================================================================
+# HomeEye · 生命周期入口（飞牛应用中心调用）
+#   start   启动服务（幂等，快速返回，不阻塞飞牛）
+#   stop    停止服务（连同 ffmpeg 子进程一起收掉）
+#   status  运行中返回 0，未运行返回 3
+#
+# 三条设计约束，改这个文件前先读懂：
+#   1. 飞牛 run-as:package 已让本脚本以应用账号运行，禁止再 setpriv/su 降权。
+#   2. start 必须快速返回（飞牛等 start 结束才判定"启动完成"），所以只做
+#      "后台拉起 + 短暂等待 socket 出现"就退出，不做复杂的 pid 反查。
+#   3. 服务用 setsid 自建会话/进程组，stop 按命令行精确匹配收掉整棵进程树
+#      （含 ffmpeg 子进程）—— 留孤儿会一直占着摄像机的连接名额，
+#      小米每台只给 3 条 P2P 会话，占满就再也拉不起流。
+#
+# 报错要说人话：$TRIM_TEMP_LOGFILE 是官方给的唯一"用户可见"通道，
+# 只写 info.log 的话，用户在应用中心只会看到"启动失败"四个字。
+# ============================================================================
+set -u
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+DEST="${TRIM_APPDEST:-/var/apps/homeeye/target}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/homeeye}"
+PORT="${HE_PORT:-17071}"
+SOCK="$DEST/app.sock"
+LOG="$VAR/info.log"
+PIDF="$VAR/app.pid"
+USERLOG="${TRIM_TEMP_LOGFILE:-}"
+PY="${HE_PY:-$(command -v python3.12 || command -v python3)}"
+
+mkdir -p "$VAR" 2>/dev/null || true
+chmod 755 "$VAR" 2>/dev/null || true
+
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >>"$LOG" 2>/dev/null; }
+
+# 既写日志也给界面看。用户在应用中心点「启动」时能看到的就是这个。
+tell_user() {
+  log_msg "$1"
+  if [ -n "$USERLOG" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$USERLOG" 2>/dev/null
+  fi
+}
+
+is_running() {
+  pgrep -f "homeeye/server/main.py" >/dev/null 2>&1
+}
+
+sock_ready() { [ -S "$SOCK" ] 2>/dev/null; }
+
+# 把用户在设置里指定的录像目录准备好
+prepare_storage() {
+  local dir
+  dir=$("$PY" - "$VAR/config.json" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+    print((cfg.get("storage") or {}).get("dir") or "")
+except Exception:
+    print("")
+PYEOF
+)
+  if [ -n "$dir" ]; then
+    mkdir -p "$dir" 2>/dev/null || true
+    chmod 750 "$dir" 2>/dev/null || true
+    log_msg "storage dir = $dir"
+    # 建不出来就等于录不进去，与其等看门狗报 broken 不如现在说清楚
+    if [ ! -w "$dir" ]; then
+      tell_user "录像目录 $dir 不可写，录像会失败（检查卷挂载与目录属主）"
+    fi
+  fi
+}
+
+start_process() {
+  if is_running; then
+    log_msg "already running, skip"
+    return 0
+  fi
+  if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+    tell_user "找不到 python3.12/python3，HomeEye 无法启动（飞牛需自带 Python 3.12+）"
+    exit 1
+  fi
+  mkdir -p "$VAR"
+  prepare_storage
+
+  # 清理残留 socket（仅在确认无服务运行时才删，避免并发竞态）
+  [ -S "$SOCK" ] && rm -f "$SOCK" 2>/dev/null
+
+  log_msg "starting (dest=$DEST sock=$SOCK user=$(id -un))"
+  # 用 setsid 自建会话，stdin/stdout/stderr 全重定向，彻底脱离飞牛调用链
+  setsid bash -c "export GATEWAY_SOCKET='$SOCK'; cd '$DEST/server' && exec '$PY' '$DEST/server/main.py'" \
+    </dev/null >>"$LOG" 2>&1 &
+  local launcher=$!
+  echo "$launcher" >"$PIDF"
+
+  # 短暂等待 socket 出现（最多 8 秒），出现即认为启动成功
+  local i=0
+  while [ $i -lt 16 ]; do
+    sleep 0.5
+    if sock_ready; then
+      log_msg "started (socket ready)"
+      return 0
+    fi
+    if ! kill -0 "$launcher" 2>/dev/null; then
+      tell_user "服务进程在启动阶段就退出了，最后几行日志："
+      if [ -n "$USERLOG" ]; then
+        tail -n 20 "$LOG" 2>/dev/null >>"$USERLOG"
+      fi
+      tail -n 20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
+      rm -f "$PIDF"
+      exit 1
+    fi
+    i=$((i + 1))
+  done
+  tell_user "启动偏慢：8 秒内网关 socket 还没出现，服务仍在后台继续起（可稍后刷新页面）"
+  return 0
+}
+
+stop_process() {
+  if ! is_running; then
+    [ -S "$SOCK" ] && rm -f "$SOCK" 2>/dev/null
+    rm -f "$PIDF"
+    log_msg "not running"
+    return 0
+  fi
+  log_msg "stopping (killing process tree)"
+  # 先优雅 TERM，再 KILL 兜底；pkill 按命令行精确匹配整个进程组
+  pkill -TERM -f "homeeye/server/main.py" 2>/dev/null
+  local i=0
+  while [ $i -lt 10 ] && is_running; do
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if is_running; then
+    log_msg "force kill"
+    pkill -KILL -f "homeeye/server/main.py" 2>/dev/null
+    sleep 1
+  fi
+  # ffmpeg 子进程由服务自己在 SIGTERM 里收（main.py 的 shutdown_all）；
+  # 上面已经等过 10 秒并做过 KILL 兜底，这里不再重复扫一遍命令行 ——
+  # 误伤别的容器里的 ffmpeg 比留一个孤儿更难查。
+  [ -S "$SOCK" ] && rm -f "$SOCK" 2>/dev/null
+  rm -f "$PIDF"
+  log_msg "stopped"
+  return 0
+}
+
+case "${1:-}" in
+  start)  start_process ;;
+  stop)   stop_process ;;
+  status)
+    if is_running; then exit 0; else exit 3; fi
+    ;;
+  *) exit 1 ;;
+esac

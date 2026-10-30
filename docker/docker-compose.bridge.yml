@@ -1,0 +1,64 @@
+# HomeEye · bridge 网络变体（macOS / Windows 上的 Docker Desktop 用）
+#
+# 默认那份 docker-compose.yml 用 host 网络，Docker Desktop 上没有可用的 host 网络，
+# 所以这里给一份显式发布端口的版本：
+#
+#   cd docker && docker compose -f docker-compose.bridge.yml up -d --build
+#   浏览器打开 http://127.0.0.1:8088
+#
+# 换来换去少掉的能力（都是网络性质决定的，不是 bug）：
+#   * 小米摄像头取流：P2P 打洞要 UDP 广播，NAT 后面会 PPCS_Connect errorcode: -3
+#     —— 直播接口 200 但 0 字节。要用小米请回 host 模式（Linux NAS）。
+#   * ONVIF 局域网发现：组播穿不过 bridge，请用「其他流 / RTSP」手工填地址。
+#   浏览器直播与录像、回放、云台（RTSP 类摄像头）在 bridge 下都正常。
+#
+# go2rtc 在容器网络里的名字就是服务名 `go2rtc`：
+#   HomeEye 设置页里「go2rtc 地址」填 http://go2rtc:1984
+#   摄像头地址写 rtsp://go2rtc:8555/<流名>
+services:
+
+  go2rtc:
+    image: alexxit/go2rtc:master-hardware
+    container_name: go2rtc
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../go2rtc:/config
+    ports:
+      - "1984:1984"     # Web API / MJPEG / SSE
+      - "8554:8554"     # RTSP
+      - "8555:8555"     # RTSP（第二路，有些配置会用到）
+      - "1935:1935"     # RTMP
+      - "8554:8554/udp"
+      - "8555:8555/udp"
+      - "1935:1935/udp"
+      - "8000:8000/udp" # WebRTC ICE
+
+  homeeye:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: homeeye:1.1.2
+    container_name: homeeye
+    restart: unless-stopped
+    depends_on:
+      - go2rtc
+    environment:
+      - HE_DATA_DIR=/data
+      - HE_HOST=0.0.0.0
+      - HE_PORT=8088
+      - HE_TLS_PORT=8443
+      - HE_MILOCO_SDK=/app/sdk/miloco-sdk-main
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../data:/data
+    ports:
+      - "8088:8088"
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--max-time", "4", "http://127.0.0.1:8088/api/health"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 90s

@@ -1,0 +1,32 @@
+# 这个项目的目标运行环境是 Linux。Windows 上把 shell 脚本存成 CRLF，
+# 装到飞牛/NAS 上就是 "bad interpreter: /bin/sh^M" —— 所以文本一律钉 LF。
+*.sh text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.patch text eol=lf
+*.example text eol=lf
+Dockerfile text eol=lf
+manifest text eol=lf
+config/privilege text eol=lf
+config/resource text eol=lf
+app/ui/config text eol=lf
+cmd/* text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+LICENSE text eol=lf
+
+# 二进制：别让 git 碰它们的内容
+*.PNG binary
+*.png binary
+*.jpg binary
+*.mp4 binary
+*.gz binary
+*.fpk binary
+app/bin/heptz binary

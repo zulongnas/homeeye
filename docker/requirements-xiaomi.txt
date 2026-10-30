@@ -1,0 +1,32 @@
+# 小米 Miloco SDK 的运行期依赖 —— 只有装了 SDK 才需要（HE_WITH_MILOCO_SDK=1）。
+#
+# HomeEye 自身**只用 Python 标准库**，没有 Python 依赖；ffmpeg 是唯一的外部程序。
+# 这份清单存在的理由只有一个：小米取流那条路要 import 它们。
+#
+#   aiohttp / aiofiles  —— SDK 网络与文件 IO
+#   requests            —— 小米云 API
+#   cryptography        —— plugin/mijia.py 与 plugin/miot/cloud.py 的云 API 加解密
+#                          （模块级 import，缺了会导致整个 SDK 加载失败）
+#   av (PyAV)           —— utils/decoder.py 被 plugin/miot/camera.py 模块级 import
+#   pydantic            —— utils/types.py 的数据模型
+#   PyYAML              —— plugin/miot/camera.py 读取配置
+#   psutil              —— SDK 运行时环境探测
+#   qrcode + Pillow     —— 扫码登录的二维码图片渲染
+#   numpy               —— ★ 音频解码必需：utils/decoder.py 的 AudioResampler
+#                          （av.AudioResampler → to_ndarray()）离开 numpy 直接报
+#                          "No module named 'numpy'"，表现是音轨一帧都没有，而
+#                          ffmpeg 又要等这条音轨，连画面一起卡成 0 字节。
+#
+# SDK 里故意不装的（都是 CLI/LLM 工具链，取流路径不会 import 它们）：
+#   openai / fastmcp    —— cli/llm.py、cli/mcp_tool.py
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+requests>=2.28.0
+cryptography>=41.0.0
+av>=12.0.0
+numpy>=1.26.0
+pydantic>=2.0.0
+PyYAML>=6.0
+psutil>=5.9.0
+qrcode>=7.4.2
+Pillow>=10.0.0

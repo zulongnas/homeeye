@@ -1,0 +1,74 @@
+# go2rtc · HomeEye 用的配置模板（**不含任何凭据**）
+#
+# 用法：复制成 go2rtc/go2rtc.yaml 再改。
+#   cp docker/go2rtc.yaml.example go2rtc/go2rtc.yaml
+#
+# go2rtc 不是必需品：RTSP / ONVIF / 其他流的摄像头，HomeEye 自己用 ffmpeg 直连就行。
+# 它解决的是另外两件事：
+#   1. 小米摄像头的原始流（`xiaomi://`）—— HomeEye 也能自己拉，但云台/对讲
+#      走 go2rtc 的定制版更稳（见 third_party/go2rtc-ptz/）；
+#   2. 一次硬件转码，把 H.265 原流转成浏览器能放的 H.264，多个消费者共用一道转码。
+#      这一条很值钱：源已经 H.264 时 HomeEye 不会再转第二遍（live.transcode=auto），
+#      实测同一路从「烧掉一个核的 57%」降到 4.7%。
+
+# ---------------------------------------------------------------- 小米账号
+# 由 go2rtc 的小米登录流程写入，形如 "<米家数字ID>: V1:xxxx"。手工填也行。
+# 留空 = 不用小米摄像头，下面 streams 里的 xiaomi:// 也就别写。
+xiaomi: {}
+#  xiaomi:
+#    "123456789": "V1:xxxxxxxxxxxxxxxx"
+
+# ---------------------------------------------------------------- 访问面
+# api.listen 收到 127.0.0.1 是刻意的：默认不设用户名密码时，go2rtc 的 /api/config
+# 会把上面那个米家 passToken 明文回给**局域网里任何一台设备**，云台也能被随便调。
+# HomeEye 和 go2rtc 在同一台机器上（host 网络），走回环互通，收回 127.0.0.1 不影响它们。
+#
+# local_auth: true 也别关：源码 internal/api/api.go 判的是
+# `if localAuth || !isLoopback(...)`，它是 false 时「只绑回环」等于没鉴权 ——
+# 同一台机器上的任何进程都能调。
+#
+# 想看 go2rtc 自带的网页：ssh -L 1984:127.0.0.1:1984 <你> <NAS_IP>，
+# 然后浏览器开 http://127.0.0.1:1984 填下面这套凭据。
+# bridge 网络（docker-compose.bridge.yml）时改成 :1984（所有网卡）并按下面配好
+# username/password，否则容器之间连不上。
+api:
+  listen: "127.0.0.1:1984"
+  username: ""          # ← 必填。留空就是裸奔
+  password: ""          # ← 必填，随机长串
+  local_auth: true
+
+rtsp:
+  listen: "127.0.0.1:8555"
+
+# ---------------------------------------------------------------- 硬转参数
+# 有 Intel 核显：h264_qsv / h264_vaapi；AMD：h264_amf。没有核显就把 #hardware
+# 从流定义里删掉，退回 CPU 软转（能吃满一个核）。
+# 先 `ls -l /dev/dri` 确认有 renderD128，再确认 compose 里 devices 放开了。
+ffmpeg:
+  h264/qsv: "-c:v h264_qsv -profile:v high -g 50 -bf 0 -preset veryslow -look_ahead 1 -extbrc 1"
+  h264/vaapi: "-c:v h264_vaapi -profile:v high -g 50 -bf 0"
+
+# ---------------------------------------------------------------- 流
+# 命名约定（HomeEye 认这个约定，别随意改名）：
+#   <名字>        原始流，通常是摄像头/小米云的 H.265，录像吃这路最省 CPU
+#   <名字>_play   转码后的 H.264 + AAC，浏览器直播吃这路
+# HomeEye 设置页里「录像源」选 RAW 就去录不带 _play 的那一路（同画质体积约省一半）。
+#
+# 下面全是示例，值都是假的 —— 复制后按你自己的摄像头改。
+streams: {}
+#  streams:
+#    # ① 普通 RTSP 摄像头（海康/大华/TP-LINK 之类），不需要小米、不需要 go2rtc 也行
+#    # gatecam: "rtsp://user:pass@192.168.1.20:554/Streaming/Channels/101"
+#    # gatecam_play: "ffmpeg:gatecam#video=h264#audio=aac#hardware#bitrate=4M"
+#
+#    # ② 小米摄像头。did 是设备 ID，model 是米家里的产品标识；
+#    #    HomeEye 的「＋ 添加小米摄像头」扫码授权后会自动带出这两个值，
+#    #    抄到这里给 go2rtc 用即可。
+#    # ktcam: "xiaomi://123456789:cn@192.168.1.24?did=988888888&model=chuangmi.camera.069a01"
+#
+#    # ③ 人声增强那段滤镜是刻意加的：摄像头喇叭回采的人声偏闷偏小，
+#    #    高通 200Hz + 低通 4kHz + compand 压动态 + 提 3dB，听电话会议/门铃清楚很多。
+#    #    不需要就整段 #raw=... 删掉。
+#    # ktcam_play: >-
+#    #   ffmpeg:ktcam#video=h264#audio=aac#hardware#bitrate=8M#raw=-ar 44100 -ac 2
+#    #   -af "aresample=async=1,highpass=f=200,lowpass=f=4000,compand=attacks=0.3:decays=0.8:points=-80/-80|-30/-15|-20/-10|0/-3,volume=3.0"

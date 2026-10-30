@@ -1,0 +1,16 @@
+{
+    ".url": {
+        "homeeye.Application": {
+            "title": "HomeEye",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "",
+            "url": "/app/homeeye",
+            "allUsers": true,
+            "gatewaySocket": "app.sock",
+            "gatewayPrefix": "/app/homeeye",
+            "control": { "accessPerm": "readonly" }
+        }
+    }
+}

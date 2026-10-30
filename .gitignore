@@ -1,0 +1,38 @@
+# 运行态与凭据：这些**永远**不许提交。
+# HomeEye 装完是零配置，摄像头/账号/录像全是用户自己产生的数据，
+# 一旦提交就等于把米家 passToken 和 24 小时监控画面公开。
+data/
+go2rtc/
+*.db
+*.sqlite
+
+# 小米 SDK：许可不允许再分发，用户自己 fetch（见 NOTICE.md 第三节）
+app/sdk/*
+!app/sdk/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 构建产物
+*.fpk
+*.tgz
+*.tar.gz
+dist-build/
+release/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# 本地覆盖（compose override、临时凭据文件）
+docker-compose.override.yml
+.env
+*.pem
+*.key

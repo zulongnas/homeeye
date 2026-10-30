@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<!--BASE-->
+<title>HomeEye</title>
+<link rel="stylesheet" href="style.css?v=8">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <path d="M4 16c4.5-7 16.5-7 21 0-4.5 7-16.5 7-21 0z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+      <circle cx="14.5" cy="16" r="3.2" fill="currentColor"/>
+      <path d="M22 6.5 8.5 25.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".55"/>
+    </svg>
+    <span class="brand-name">HomeEye</span>
+    <span class="brand-sub">Home NVR</span>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="live">实时画面</button>
+    <button class="tab" data-view="play">录像回放</button>
+    <button class="tab" data-view="setting">设置</button>
+  </nav>
+
+  <div class="top-right">
+    <span class="chip" id="chipStorage" title="录像占用">—</span>
+    <span class="chip dot-chip" id="chipHealth" title="链路健康：正常 / 离线（断电，不告警）/ 异常"><i class="dot"></i><span>链路检测中</span></span>
+    <span class="chip dot-chip" id="chipRec"><i class="dot"></i><span>待机</span></span>
+  </div>
+</header>
+
+<main>
+
+  <!-- ================= 实时画面 ================= -->
+  <section class="view active" id="view-live">
+    <div class="live-toolbar">
+      <div class="seg" id="gridPick">
+        <button data-n="1" title="单画面">1</button>
+        <button data-n="2" title="两格">2</button>
+        <button data-n="4" class="on" title="四格">4</button>
+        <button data-n="6" title="六格">6</button>
+        <button data-n="9" title="九格">9</button>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="fitToggle" checked>
+        <span>适应比例</span>
+      </label>
+      <button class="btn ghost" id="btnSound" title="打开/关闭声音">🔇 静音</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btnAddCam">＋ 添加摄像头</button>
+    </div>
+
+    <!-- 每格放哪台摄像头：摄像头比格子多时必用；单画面时等于"看哪一台" -->
+    <div class="pick-bar" id="pickBar" hidden></div>
+
+    <div class="stage" id="stage">
+      <div class="grid" id="grid"></div>
+      <div class="empty" id="emptyHint" hidden>
+        <p class="empty-title">还没有摄像头</p>
+        <p class="empty-sub">点右上角「＋ 添加摄像头」，先选类型再填参数。<br>
+          <b>小米摄像头</b>：米家 App 扫码授权即可，不用开 RTSP<br>
+          <b>通用 RTSP</b>：乔安 / 海康 / 大华 / TP-Link 等<br>
+          <b>ONVIF</b>：自动扫描局域网设备<br>
+          格式示例：<code>rtsp://用户名:密码@192.168.1.64:554/Streaming/Channels/101</code></p>
+        <button class="btn primary" id="btnAddCam2">添加第一个摄像头</button>
+      </div>
+    </div>
+
+    <button class="fs-fab" id="btnFullscreen" title="全屏（双击画面也可以）" hidden>
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 9V4h5"/><path d="M20 15v5h-5"/><path d="M15 4h5v5"/><path d="M9 20H4v-5"/>
+      </svg>
+    </button>
+  </section>
+
+  <!-- ================= 录像回放 ================= -->
+  <section class="view" id="view-play">
+    <div class="play-toolbar">
+      <select id="playCam" class="select"></select>
+      <div class="days" id="dayList"></div>
+      <div class="spacer"></div>
+      <span class="mono" id="playClock">--:--:--</span>
+    </div>
+
+    <div class="player-wrap">
+      <video id="player" playsinline preload="metadata" controls></video>
+      <div class="player-mask" id="playerMask">
+        <span class="player-tip" id="playerTip">选择摄像头和日期后开始回放</span>
+      </div>
+      <button class="fs-fab in-player" id="btnPlayerFs" title="全屏">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 9V4h5"/><path d="M20 15v5h-5"/><path d="M15 4h5v5"/><path d="M9 20H4v-5"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="timeline" id="timeline">
+      <div class="tl-ruler" id="tlRuler"></div>
+      <div class="tl-track" id="tlTrack">
+        <div class="tl-blocks" id="tlBlocks"></div>
+        <div class="tl-head" id="tlHead"></div>
+      </div>
+    </div>
+    <div class="tl-hint">点时间轴任意位置跳转；空白处代表那一刻没有录像</div>
+  </section>
+
+  <!-- ================= 设置 ================= -->
+  <section class="view" id="view-setting">
+    <!-- 单页 + 左侧分区导航：导航项由 JS 从下面各 .card 的标题派生，
+         不硬编码第二份清单，加卡片不会漏导航。 -->
+    <div class="set-layout">
+      <nav class="set-nav" id="setNav" aria-label="设置分区"></nav>
+      <div class="set-main" id="setMain">
+    <div class="cards">
+      <!-- ---------- 1. 摄像机 ---------- -->
+      <div class="card">
+        <h3>摄像机 <span class="card-sub">小米 / 通用 RTSP / ONVIF / 其他流</span></h3>
+        <div id="camList" class="cam-list"></div>
+        <div class="row-end" style="margin-top:10px">
+          <button class="btn primary" id="btnAddCamSet">＋ 添加摄像头</button>
+        </div>
+      </div>
+
+      <!-- ---------- 2. 云台 ---------- -->
+      <div class="card">
+        <h3>云台控制 <span class="card-sub">小米云台机</span></h3>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="setPtzOn"> <span>启用云台</span></label>
+          <p class="hint">
+            小米云台不走官方取流 SDK，而是米家的 miss 私有命令
+            （<code>cmdMotorReq</code> + <code>cmdSpeakerStartReq</code>），
+            必须跑在一条<b>已经建立的</b> P2P 会话上。
+          </p>
+        </div>
+        <p class="hint" id="ptzState">状态：—</p>
+        <div class="field-row">
+          <div class="field">
+            <label>后端模式</label>
+            <select id="setPtzMode">
+              <option value="auto">自动（推荐）</option>
+              <option value="go2rtc">go2rtc 复用取流会话</option>
+              <option value="sidecar">独立侧车（自己开会话）</option>
+            </select>
+            <p class="hint">
+              <b>go2rtc 复用</b>：云台命令直接下发到 go2rtc 已有的那条取流会话，
+              <b>不占用新的会话名额</b>。这是最稳的方式——小米摄像头的 P2P
+              并发上限只有 3 条，多开一条就会把所有人挤掉（表现为 <code>cs2: EOF</code>）。
+            </p>
+          </div>
+          <div class="field">
+            <label>go2rtc API 地址</label>
+            <input id="setPtzG2r" type="text" placeholder="留空 = 自动探测，如 http://127.0.0.1:1984">
+            <p class="hint">需要 go2rtc 是打过云台补丁的版本。</p>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>go2rtc 用户名</label>
+            <input id="setPtzG2rUser" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="go2rtc 配了 api.username 才要填">
+          </div>
+          <div class="field">
+            <label>go2rtc 密码</label>
+            <input id="setPtzG2rPass" type="password" autocomplete="new-password"
+                   placeholder="留空 = 不修改">
+            <p class="hint">
+              go2rtc 的 API 能直接读走米家 passToken、也能下发云台/对讲命令，
+              等于账号密码，所以它一旦开了 <code>api.username/password</code>，
+              这里就要填同样的凭据。填错会明确报「go2rtc 拒绝了请求（HTTP 401）」。
+            </p>
+          </div>
+        </div>
+        <p class="hint">
+          画面右上角出现的 <b>✥</b> 是云台方向盘，<b>🎤</b> 是按住说话（对讲）。
+          对讲用的是<b>你当前这台电脑/手机</b>的麦克风，浏览器只在 HTTPS 下才
+          授权麦克风，所以服务另外开了一个 HTTPS 端口（默认 8443）：
+          用 <code>https://NAS地址:8443</code> 打开本页面，首次接受自签证书后即可对讲。
+        </p>
+        <div class="row-end" style="margin-bottom:10px">
+          <button class="btn ghost" id="btnPtzImport">从 go2rtc 导入凭据</button>
+          <button class="btn ghost" id="btnPtzMigrate">小米摄像头改走 go2rtc</button>
+          <button class="btn ghost" id="btnTalkBeep">测试提示音</button>
+        </div>
+        <p class="hint" id="ptzMigrateMsg"></p>
+        <div class="field-row">
+          <div class="field">
+            <label>排障：下行音频</label>
+            <label class="check"><input type="checkbox" id="setPtzAudio"> <span>打开摄像头麦克风（听环境音，仅排障用）</span></label>
+            <p class="hint">
+              默认关闭。实测在客厅这台机型上打开后，摄像头就不再回报云台角度了
+              （0x113 停发），所以只在对讲没声音时临时打开排查。
+            </p>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>米家账号 ID</label>
+            <input id="setPtzUser" type="text" placeholder="纯数字，例如 999999999">
+          </div>
+          <div class="field">
+            <label>passToken</label>
+            <input id="setPtzToken" type="password" placeholder="留空 = 不修改">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>点一下转动（秒）</label>
+            <input id="setPtzStep" type="number" min="0.1" max="2" step="0.05">
+            <p class="hint">按住方向键会连续转动，松开立刻停。</p>
+          </div>
+          <div class="field">
+            <label>会话空闲释放（秒）</label>
+            <input id="setPtzIdle" type="number" min="10" max="600" step="5">
+            <p class="hint">
+              仅「独立侧车」模式生效：闲置超过这个时间就主动断开，把摄像头的
+              会话名额还给取流，避免互相踢掉。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ---------- 3. 录像存储 ---------- -->
+      <div class="card">
+        <h3>录像存储</h3>
+        <div class="field">
+          <label>录像目录（这台机器上能写的地方）</label>
+          <select id="setDirPick" class="select"></select>
+          <p class="hint" id="setRootsHint">正在读取挂载点…</p>
+        </div>
+        <div class="field">
+          <label>或者手填绝对路径</label>
+          <input id="setDir" type="text" placeholder="留空 = 应用数据目录（推荐先留空）">
+          <p class="hint">容器只看得见 compose 挂进来的路径；下拉里没有说明这个容器还没挂那块盘，需要先在编排里加一条 bind mount。保存时会先试写一次，写不进去不会保存。</p>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>录制模式</label>
+            <select id="setRecMode" class="select">
+              <option value="continuous">全时录制</option>
+              <option value="off">不录制</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>单段时长（分钟）</label>
+            <input id="setSegLen" type="number" min="1" max="180" step="1">
+          </div>
+        </div>
+        <div class="field">
+          <label>录哪一路</label>
+          <select id="setRecSource" class="select">
+            <option value="PLAYED">转码后的流（与实时画面一致，H.264，浏览器直接能放）</option>
+            <option value="RAW">摄像头原始流（省掉 go2rtc 那道转码，体积/画质是摄像机自己那份）</option>
+          </select>
+          <p class="hint">
+            家里那两路的地址是 go2rtc 的 <code>*_play</code>，也就是<b>已经软转成 H.264</b> 的那一份。
+            录它 = 存的是二次编码的产物，画质比摄像机自己拍的差一档；录原始流 = 摄像机那份
+            （小米多为 H.265，同样画质体积大约省一半），但回放页解不了 H.265 时要现场转一道。
+            改这一项会让录像进程按新地址重启一次，不算故障。<b>不会动摄像头上的 SD 卡录像。</b>
+          </p>
+          <div id="recSourceNotes" class="health-box"></div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>保留天数（0 = 不删除）</label>
+            <input id="setRetention" type="number" min="0" max="3650" step="1">
+          </div>
+          <div class="field">
+            <label>容量上限（GB，0 = 不限）</label>
+            <input id="setBudget" type="number" min="0" max="100000" step="10">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>事件录像额外保留（天）</label>
+            <input id="setKeepEvents" type="number" min="0" max="3650" step="1">
+            <p class="hint h-bad" id="keepEventsWhy"></p>
+          </div>
+          <div class="field">
+            <label>录像带音频</label>
+            <label class="check"><input type="checkbox" id="setRecAudio"> <span>包含音频轨</span></label>
+          </div>
+        </div>
+        <p class="hint" id="setEffDir">生效目录：—</p>
+        <p class="hint" id="setStorageState">存储状态：—</p>
+      </div>
+
+      <!-- ---------- 3. 移动侦测（设备侧配置面）---------- -->
+      <div class="card" id="motionCard">
+        <h3>移动侦测 <span class="card-sub">直接读写摄像头自己的设置</span></h3>
+        <p class="hint">
+          小米摄像头的移动侦测是在<b>设备里</b>判的，米家 SDK 又不把事件推给 HomeEye，
+          所以这里不做「HomeEye 自己分析画面」，而是把摄像头上的开关读出来、改回去：<br>
+          下面显示的就是那台摄像头<b>此刻生效</b>的配置；保存会逐条下发到设备并<b>回读校验</b>，
+          回读不一致会当场说。设备离线时格子留空并写明读不到 —— 不拿上次的值冒充现在的值。
+        </p>
+        <div class="field-row">
+          <div class="field">
+            <label>摄像头</label>
+            <select id="motionCam"></select>
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <div class="field-row">
+              <button class="btn ghost" id="btnMotionReload" type="button">重新读取设备</button>
+              <button class="btn primary" id="btnMotionSave" type="button">下发改动</button>
+            </div>
+          </div>
+        </div>
+        <p class="hint" id="motionState">设备配置：还没读取。</p>
+        <div id="motionForm"><p class="hint muted">选择摄像头后自动读取。</p></div>
+        <p class="hint">「下发改动」只提交你动过的格子；SD 卡与卡容量是设备只读上报，改不了。</p>
+
+        <!-- HomeEye 侧本地分析参数：确实没有消费者，灰着并说清为什么 -->
+        <h3 class="sub-h3">HomeEye 侧的画面分析参数</h3>
+        <p class="hint h-bad" id="motionLocalWhy"></p>
+        <div class="field-row">
+          <div class="field">
+            <label>事件前预录（秒）</label>
+            <input id="setPreSec" type="number" min="0" max="60" step="1">
+          </div>
+          <div class="field">
+            <label>事件后补录（秒）</label>
+            <input id="setPostSec" type="number" min="0" max="300" step="1">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>最小连续帧数</label>
+            <input id="setMinFrames" type="number" min="1" max="60" step="1">
+          </div>
+          <div class="field">
+            <label>单事件最长（秒）</label>
+            <input id="setMaxEvent" type="number" min="10" max="3600" step="10">
+          </div>
+        </div>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="setDetectPersons"> <span>优先识别人形（减少宠物/树叶误报）</span></label>
+        </div>
+      </div>
+
+      <!-- ---------- 4. 通知告警 ---------- -->
+      <div class="card">
+        <h3>通知告警 <span class="card-sub">邮件推送</span></h3>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="setNotifyOn"> <span>启用邮件通知</span></label>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>SMTP 服务器</label>
+            <input id="setSmtpHost" type="text" spellcheck="false" placeholder="smtp.qq.com">
+          </div>
+          <div class="field">
+            <label>端口</label>
+            <input id="setSmtpPort" type="number" min="1" max="65535" step="1">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>账号</label>
+            <input id="setSmtpUser" type="text" spellcheck="false" placeholder="your@qq.com">
+          </div>
+          <div class="field">
+            <label>密码 / 授权码</label>
+            <input id="setSmtpPass" type="password" placeholder="留空表示不修改">
+          </div>
+        </div>
+        <div class="field">
+          <label>收件人（多个用逗号分隔）</label>
+          <input id="setToAddrs" type="text" spellcheck="false" placeholder="a@qq.com, b@163.com">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>通知时机</label>
+            <label class="check"><input type="checkbox" id="setOnMotion"> <span>移动侦测（没有这种事件，勾了不会发）</span></label>
+            <label class="check"><input type="checkbox" id="setOnFault"> <span>摄像头离线</span></label>
+          </div>
+          <div class="field">
+            <label>故障重发间隔（秒）</label>
+            <input id="setFaultCd" type="number" min="30" max="86400" step="30">
+          </div>
+        </div>
+        <div class="row-end" style="margin-top:2px">
+          <button class="btn ghost" id="btnNotifyTest">发送测试邮件</button>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setDndOn"> <span>免打扰时段</span></label>
+          </div>
+          <div class="field">
+            <label>从 — 到</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input id="setDndStart" type="time" style="flex:1">
+              <span class="hint" style="margin:0">—</span>
+              <input id="setDndEnd" type="time" style="flex:1">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ---------- 5. 实时画面 ---------- -->
+      <div class="card">
+        <h3>实时画面</h3>
+        <div class="field-row">
+          <div class="field">
+            <label>转码宽度（0 = 原始）</label>
+            <input id="setLiveWidth" type="number" min="0" max="3840" step="16">
+          </div>
+          <div class="field">
+            <label>转码帧率（0 = 原始）</label>
+            <input id="setLiveFps" type="number" min="0" max="60" step="1">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>画质（1~31，越小越清晰）</label>
+            <input id="setLiveQuality" type="number" min="1" max="31" step="1">
+          </div>
+          <div class="field">
+            <label>无人观看停流（秒）</label>
+            <input id="setIdleStop" type="number" min="3" max="300" step="1">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>小米默认画质</label>
+            <select id="setXmQuality" class="select">
+              <option value="HIGH">高清</option>
+              <option value="LOW">流畅</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>打开页面自动播放</label>
+            <label class="check"><input type="checkbox" id="setAutoplay"> <span>自动播放</span></label>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>浏览器兼容转码</label>
+            <select id="setLiveTranscode" class="select">
+              <option value="auto">自动（源已是 H.264 就直拷，不再二次转码）</option>
+              <option value="always">总是转成 H.264（老行为，最兼容）</option>
+              <option value="never">从不转码（源不是 H.264 时浏览器会黑屏）</option>
+            </select>
+          </div>
+        </div>
+        <p class="hint" id="liveTranscodeWhy">
+          浏览器（mpegts.js / MSE）解不了 H.265，所以源是 HEVC 时必须转一道。
+          但 go2rtc 的 <code>*_play</code> 那一路<b>已经是转好的 H.264</b>，
+          HomeEye 再软转一遍就是双重转码：一路 1080p 白吃一个核，还把帧率压到上面那个值。
+          选「自动」时 HomeEye 会先问一次源是什么编码，能直拷就直拷。<br>
+          直拷时上面那三项（转码宽度 / 帧率 / 画质）<b>都不再起作用</b>——画面就是 go2rtc 那份，
+          码率也是它定的（现网 <code>bitrate=8M</code>）。走外网看觉得卡，要改的是 go2rtc 那一路，
+          不是把 HomeEye 的转码再开回来。
+        </p>
+        <div class="field">
+          <label>这一路实际怎么取的 <span class="card-sub">打开过实时画面后才有值</span></label>
+          <div id="liveVideoMode" class="health-box"></div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>实时画面声音</label>
+            <label class="check"><input type="checkbox" id="setLiveAudio">
+              <span>取音频（点画面右上角喇叭开声；关掉可省一点 CPU 和带宽）</span></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>对讲 <span class="card-sub">麦克风能不能用，取决于页面是怎么打开的</span></h3>
+        <p class="hint">
+          浏览器只允许<b>安全上下文</b>里的页面调麦克风 —— 判的是<b>页面来源</b>，
+          不是声音用什么方式传出去。所以把对讲换成 WebRTC 也免不掉这一条；
+          反过来，走下面任一条通了，麦克风就直接可用，不需要额外开关。
+        </p>
+        <div id="talkDiag" class="health-box"></div>
+        <p class="hint" id="talkChain">对讲链路：—</p>
+      </div>
+
+      <div class="card">
+        <h3>链路健康 <span class="card-sub">设备在线 · 取流会话 · 录像落盘</span></h3>
+        <p class="hint" id="healthSummary">—</p>
+        <div id="healthBox" class="health-box">—</div>
+        <div class="row-end" style="margin-bottom:8px">
+          <button class="btn ghost" id="btnHealthRefresh">立即重新判定</button>
+        </div>
+        <p class="hint">
+          <b>断电离线不算故障。</b>主卧那台晚上会被拔插头、白天再插上，这是预期工况：
+          离线期间只记状态流水（不发邮件、不反复重起录像进程），插上后自动恢复录制。<br>
+          只有 <b>链路异常</b>（设备在网但画面或录像不通、目录不可写、会话卡死）
+          才发邮件，也才会让容器 healthcheck 变红。
+        </p>
+        <details class="health-events">
+          <summary>状态变化记录</summary>
+          <div id="healthEvents" class="mono">—</div>
+        </details>
+      </div>
+
+      <div class="card">
+        <h3>自愈看门狗 <span class="card-sub">卡死补线程 · 换 IP 纠源 · 修复退避</span></h3>
+        <p class="hint" id="watchdogSummary">—</p>
+        <details class="health-events">
+          <summary>自愈流水</summary>
+          <div id="watchdogActions" class="mono">—</div>
+        </details>
+        <div class="field" style="margin-top:8px">
+          <label class="check">
+            <input type="checkbox" id="setWdOn"> <span>开着门狗（关掉后只剩健康判定，不会再自己动）</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="setWdRepair"> <span>自动修复链路（重建取流会话，不重启 go2rtc）</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="setWdDrift"> <span>IP 漂移自愈（路由器换了地址就把源里的地址改对）</span>
+          </label>
+          <p class="hint">
+            主卧那台晚上拔插头、白天再插上，重新插上时常常拿到一个新地址。
+            go2rtc 的小米源里绑的是<b>写配置那一刻</b>的地址，而取流直接对这个地址发 UDP ——
+            不纠回来的话这条源会永久失败，而且每一轮都重试一次。开着漂移自愈后，
+            看门狗拿米家云报告的局域网地址（<code>localip</code>）和源里的地址比一下，
+            不一样就只改这一条流（<code>PUT /api/streams</code>，不重启、不碰别的流、
+            写完复核，复核不过自动退回原值）。
+          </p>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>巡时间隔（秒）</label>
+            <input id="setWdInterval" type="number" min="15" max="600" step="5">
+          </div>
+          <div class="field">
+            <label>心跳超时（秒）</label>
+            <input id="setWdStale" type="number" min="90" max="3600" step="10">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>同一台两次修复最少间隔（秒）</label>
+            <input id="setWdCooldown" type="number" min="60" max="7200" step="30">
+          </div>
+          <div class="field">
+            <label>连修几次还没好就交给人</label>
+            <input id="setWdMaxTries" type="number" min="1" max="10" step="1">
+          </div>
+        </div>
+        <p class="hint">
+          <b>间隔与退避为什么要有下限：</b>巡间隔低于 15 秒会把云台/对讲用的
+          P2P 会话名额挤爆（小米同一账号最多 3 路并发）；修复退避是为了不再出现
+          「一台断电，每 3 秒起一个 ffmpeg，3.5 小时白起 2300 个进程」那种场面。
+          心跳超时是判「循环卡死」的依据 —— 线程卡在小米云调用里时 <code>is_alive()</code>
+          仍然是真的，只有心跳会停。
+        </p>
+        <div class="row-end" style="margin-bottom:6px">
+          <button class="btn ghost" id="btnWatchdogNow">立即巡检一轮</button>
+          <button class="btn ghost" id="btnWatchdogRepair">手动修复全部异常</button>
+        </div>
+        <p class="hint" id="watchdogState">状态：—</p>
+      </div>
+
+      <div class="card">
+        <h3>账号安全 <span class="card-sub">登录闸门</span></h3>
+        <div class="field-row">
+          <div class="field">
+            <label>登录用户名</label>
+            <input id="setAuthUser" type="text" spellcheck="false" autocomplete="username">
+          </div>
+          <div class="field">
+            <label>会话有效期（小时）</label>
+            <input id="setAuthHours" type="number" min="1" max="720" step="1">
+          </div>
+        </div>
+        <div class="field">
+          <label class="check">
+            <input type="checkbox" id="setAuthOn"> <span>开启登录闸门</span>
+          </label>
+          <p class="hint">
+            HomeEye 监听 0.0.0.0，局域网里任何设备都能看画面、拖录像，
+            云台/对讲接口也在同一个端口上。关掉闸门就等于把家门钥匙留在门上 ——
+            只有确认整台 NAS 只通过飞牛网关访问时才建议关闭。
+          </p>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>原密码</label>
+            <input id="setPassOld" type="password" autocomplete="current-password"
+                   placeholder="首次设置留空">
+          </div>
+          <div class="field">
+            <label>新密码</label>
+            <input id="setPassNew" type="password" autocomplete="new-password"
+                   placeholder="至少 6 位">
+          </div>
+        </div>
+        <div class="row-end" style="margin-bottom:6px">
+          <button class="btn ghost" id="btnLogout">退出登录</button>
+          <button class="btn primary" id="btnSetPassword">设置密码</button>
+        </div>
+        <p class="hint" id="authState">状态：—</p>
+        <p class="hint">
+          密码只保存 PBKDF2 派生值，配置文件里不会出现明文。
+          8088 是 HTTP，密码会明文穿过局域网，<b>设完密码请改用
+          <code>https://NAS地址:8443</code> 访问</b>（自签证书点一次「继续访问」，
+          对讲本来也必须走 HTTPS）。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>存储占用</h3>
+        <div id="usageBox" class="usage-box">—</div>
+      </div>
+
+      <div class="card muted-card">
+        <h3>关于</h3>
+        <p class="hint">
+          HomeEye · 自建 NVR，本地运行、不上传任何画面。<br>
+          实时预览走 MPEG-TS + MSE（低延迟、低带宽）；录像为分段 MP4（可直接用文件管理器打开播放）。
+        </p>
+        <p class="hint mono" id="aboutVer">version —</p>
+      </div>
+
+      <!-- 设置页底部操作条：跨满两列，改完任何一处都能顺手保存 -->
+      <div class="save-bar">
+        <span class="hint" style="margin:0">改完记得保存，保存后取流与录像会按新参数自动重启。</span>
+        <div class="spacer"></div>
+        <button class="btn ghost" id="btnReloadSettings">放弃修改</button>
+        <button class="btn primary" id="btnSaveSettings">保存全部设置</button>
+      </div>
+    </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ================= 登录弹窗 ================= -->
+<div class="modal" id="loginModal" hidden>
+  <div class="modal-card login-card">
+    <div class="modal-head"><h3 id="loginTitle">HomeEye 登录</h3></div>
+    <div class="modal-body">
+      <p class="hint" id="loginHint">这台 HomeEye 已开启登录闸门。</p>
+      <div class="field">
+        <label>用户名</label>
+        <input id="loginUser" type="text" spellcheck="false" autocomplete="username">
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input id="loginPass" type="password" autocomplete="current-password">
+      </div>
+      <p class="hint err-text" id="loginError" hidden></p>
+    </div>
+    <div class="modal-foot">
+      <div class="spacer"></div>
+      <button class="btn primary" id="btnLogin">登录</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 摄像头弹窗 ================= -->
+<div class="modal" id="camModal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 id="camModalTitle">添加摄像头</h3>
+      <button class="icon-btn" id="camModalClose" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <!-- 第 1 步：选择摄像头类型 -->
+      <div id="camStepType">
+        <p class="hint">第 1 步：选择摄像头类型，不同品牌走不同的接入方式。</p>
+        <div class="type-grid" id="camTypeGrid">
+          <button class="type-card" data-ctype="xiaomi">
+            <div class="tc-icon">📷</div>
+            <div class="tc-name">小米摄像头</div>
+            <div class="tc-desc">米家 App 扫码授权，走官方 Miloco 协议，无需摄像头开 RTSP</div>
+          </button>
+          <button class="type-card" data-ctype="rtsp">
+            <div class="tc-icon">🔌</div>
+            <div class="tc-name">通用 RTSP</div>
+            <div class="tc-desc">乔安 / 海康 / 大华 / TP-Link 等，需摄像头开启 RTSP 并填入地址</div>
+          </button>
+          <button class="type-card" data-ctype="onvif">
+            <div class="tc-icon">🔍</div>
+            <div class="tc-name">ONVIF 发现</div>
+            <div class="tc-desc">自动扫描局域网内的 ONVIF 设备，选中后自动带出 RTSP 地址</div>
+          </button>
+          <button class="type-card" data-ctype="url">
+            <div class="tc-icon">🌐</div>
+            <div class="tc-name">其他流地址</div>
+            <div class="tc-desc">HTTP-FLV / HLS / 本地文件等任意 ffmpeg 能解的地址</div>
+          </button>
+        </div>
+      </div>
+
+      <!-- 第 2 步：按类型填写 -->
+      <div id="camStepForm" hidden>
+        <p class="hint" id="camTypeHint"></p>
+        <div class="field">
+          <label>名称</label>
+          <input id="camName" type="text" placeholder="例如：客厅 / 门口">
+        </div>
+        <div class="field" id="fieldUrl">
+          <label>流地址</label>
+          <input id="camUrl" type="text" spellcheck="false"
+                 placeholder="rtsp://admin:密码@192.168.1.64:554/Streaming/Channels/101">
+        </div>
+        <div class="field" id="fieldUser" hidden>
+          <label>用户名</label>
+          <input id="camUser" type="text" spellcheck="false" placeholder="admin">
+        </div>
+        <div class="field" id="fieldPass" hidden>
+          <label>密码</label>
+          <input id="camPass" type="password" placeholder="摄像头登录密码">
+        </div>
+        <div class="field" id="fieldDid" hidden>
+          <label>设备 DID</label>
+          <input id="camDid" type="text" spellcheck="false" placeholder="小米摄像头的 DID，如 988888888">
+          <p class="hint">不确定 DID？用上面的「＋ 添加小米摄像头」扫码即可自动带出。</p>
+        </div>
+        <div class="field" id="fieldQuality" hidden>
+          <label>画质</label>
+          <select id="camQuality" class="select">
+            <option value="HIGH" selected>高清</option>
+            <option value="LOW">流畅</option>
+          </select>
+        </div>
+        <div class="field" id="fieldOnvif" hidden>
+          <label>ONVIF 设备</label>
+          <select id="camOnvif" class="select">
+            <option value="">（点击右侧「扫描」按钮发现设备）</option>
+          </select>
+          <div class="row-end" style="margin-top:6px">
+            <button class="btn ghost" id="btnOnvifScan" type="button">扫描局域网</button>
+          </div>
+        </div>
+        <div class="field-row" id="rowTransport">
+          <div class="field">
+            <label>传输方式</label>
+            <select id="camTransport" class="select">
+              <option value="tcp" selected>TCP（推荐）</option>
+          <option value="udp">UDP</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>能力</label>
+            <label class="check"><input type="checkbox" id="camRecord" checked> <span>录像</span></label>
+            <label class="check"><input type="checkbox" id="camEnabled" checked> <span>启用</span></label>
+          </div>
+        </div>
+        <!-- 测试连接的结果提示（openCamModal 会写这里，缺失会导致弹窗打不开） -->
+        <p class="hint" id="camTestHint"></p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="btnCamBack" hidden>← 返回</button>
+      <button class="btn ghost" id="btnTestCam">测试连接</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btnCamCancel">取消</button>
+      <button class="btn primary" id="btnCamSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<!-- ================= 小米摄像头扫码 ================= -->
+<div class="modal" id="xmModal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>添加小米摄像头</h3>
+      <button class="icon-btn" id="xmModalClose" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="xmStepAuth">
+        <p class="hint">第 1 步：用手机「米家」App 扫描下方二维码授权</p>
+        <div class="xm-qr-box">
+          <img id="xmQr" alt="扫码登录">
+          <div class="xm-qr-mask" id="xmQrMask" hidden><span>加载中…</span></div>
+        </div>
+        <p class="hint" id="xmHint">正在获取二维码…</p>
+        <div class="row-end">
+          <button class="btn primary" id="btnXmQr">重新生成二维码</button>
+        </div>
+      </div>
+      <div id="xmStepPick" hidden>
+        <p class="hint">第 2 步：勾选要接入的摄像头</p>
+        <div class="row-end" style="margin-bottom:8px">
+          <button class="btn ghost" id="btnXmSelAll">全选</button>
+          <button class="btn primary" id="btnXmAdd">添加选中</button>
+        </div>
+        <div id="xmDevList" class="cam-list"></div>
+        <p class="hint" id="xmPickHint">授权成功后自动加载</p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="btnXmCancel">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script src="mpegts.min.js"></script>
+<script src="app.js?v=24"></script>
+</body>
+</html>

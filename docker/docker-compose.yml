@@ -1,0 +1,79 @@
+# HomeEye · 开箱部署（docker compose）
+#
+#   docker compose up -d --build          构建并启动
+#   浏览器打开 http://<这台机器的IP>:8088  —— 第一件事是设登录密码（认领这台 NVR）
+#
+# 装完是**零配置**：没有摄像头、没有米家账号、没有录像。摄像头要你在设置页里
+# 自己加，凭据只落在你自己的 data/ 目录里（见 .gitignore，别把它提交到任何地方）。
+#
+# ── 要改的三个地方 ────────────────────────────────────────────────
+#   1. TZ               时区。录像文件名按它命名，填错录像时间轴就对不上。
+#   2. ../data          配置 + 录像 + 登录态 + 米家授权缓存（仓库根下的 data/）。
+#                       换到大容量卷上就改这一行。
+#   3. network_mode     见下面「为什么是 host」。
+#
+# ── 为什么默认用 host 网络 ────────────────────────────────────────
+# 两个功能是 bridge 模式下坏的：
+#   * 小米取流走 P2P(PPCS)，要 UDP 广播/组播与打洞。bridge 的 NAT 把打洞打歪，
+#     表现是 PPCS_Connect errorcode: -3，直播接口 HTTP 200 但 0 字节。
+#   * ONVIF 局域网发现靠组播，bridge 下收不到回应。
+# host 模式下两个容器用 127.0.0.1 直接互通，和飞牛 fpk 版行为一致。
+#
+# macOS / Windows 上的 Docker Desktop 没有可用的 host 网络，那种环境请改用仓库里
+# 的 bridge 变体（功能会少上面两项）：
+#   docker compose -f docker/docker-compose.bridge.yml up -d --build
+services:
+
+  go2rtc:
+    # 官方镜像就够跑通「拉流 + 硬件转码」。
+    # 只有小米云台控制与语音对讲需要打过补丁的版本（见 third_party/go2rtc-ptz/）：
+    #   sh tools/build-go2rtc-ptz.sh     # 产出 homeeye/go2rtc:1.1.2-ptz
+    #   然后把下面的 image 换成它。
+    image: alexxit/go2rtc:master-hardware
+    container_name: go2rtc
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../go2rtc:/config
+    # Intel/AMD 核显硬转 H.264 才需要下面两行；没有 /dev/dri 的机器留着会起不来。
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # privileged: true
+    # 不给 go2rtc 配 healthcheck：官方镜像里未必有 curl，编一个探测方式等于猜。
+    # homeeye 的 /api/health 会去探 go2rtc 的接口，链路断了在那里就能看见。
+
+  homeeye:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      # 需要小米摄像头：先 sh tools/fetch-miloco-sdk.sh，再放开这两行。
+      # args:
+      #   HE_WITH_MILOCO_SDK: "1"
+    image: homeeye:1.1.2
+    container_name: homeeye
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - go2rtc
+    environment:
+      - HE_DATA_DIR=/data
+      - HE_HOST=0.0.0.0
+      - HE_PORT=8088
+      # 对讲要用浏览器麦克风，而麦克风只在安全上下文（HTTPS 或 127.0.0.1）下放给
+      # 网页。8443 是自签证书，浏览器点一次「继续访问」即可；HE_TLS_PORT=0 关掉。
+      - HE_TLS_PORT=8443
+      - HE_MILOCO_SDK=/app/sdk/miloco-sdk-main
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../data:/data
+    healthcheck:
+      # /api/health 判的是业务链路：进程活着且至少一路摄像头没卡在 broken。
+      # 摄像头被拔电（offline）不算故障、不会让容器变红；取流/录像真断了才 503。
+      test: ["CMD", "curl", "-sf", "--max-time", "4", "http://127.0.0.1:8088/api/health"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      # 首个探测会同步探一次链路（go2rtc + 米家云端），给足启动余量，别刚重启就变红
+      start_period: 90s

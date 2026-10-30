@@ -1,0 +1,2009 @@
+diff --git a/cmd/heptz/main.go b/cmd/heptz/main.go
+new file mode 100644
+index 0000000..b840c70
+--- /dev/null
++++ b/cmd/heptz/main.go
+@@ -0,0 +1,722 @@
++// HomeEye PTZ sidecar.
++//
++// Holds one Mi Home "miss" P2P session per camera and exposes a tiny HTTP API so
++// HomeEye can drive the pan/tilt motor (and later the two-way audio channel)
++// without touching the Xiaomi SDK it already uses for streaming.
++//
++// The cloud credentials are only used to fetch per-connection P2P parameters
++// (vendor / public key / sign), exactly like go2rtc does for its xiaomi:// source.
++package main
++
++import (
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"log"
++	"math"
++	"net/http"
++	"net/url"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi"
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi/crypto"
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi/miss"
++)
++
++type CamCfg struct {
++	Name   string `json:"name"`
++	IP     string `json:"ip"`
++	DID    string `json:"did"`
++	Model  string `json:"model"`
++	Online *bool  `json:"online,omitempty"` // nil = 云端没给这个字段
++}
++
++type session struct {
++	cfg     CamCfg
++	client  *miss.Client
++	created time.Time
++	err     error
++	moves   int
++	lastOp  int
++	lastRes string
++	lastCmd uint32
++
++	// 下行媒体计数。audioLevel 是对讲自检的关键：往摄像头喇叭推音时，
++	// 如果它的麦克风把声音采了回来，这个值会明显抬起来——单会话就能验证
++	// 「喇叭真的响了吗」，不用再额外开一路会话去录音。
++	nextTry  time.Time // 拨号失败后的冷却截止时间
++	fails    int       // 连续拨号失败次数（退避用）
++	lastUse  time.Time // 最后一次被使用（用于空闲回收）
++
++	videoPkts  int
++	audioPkts  int
++	audioLevel float64 // 最近一包音频的 RMS，0..1
++	audioPeak  float64 // 本次会话听到过的最大峰值，0..1
++}
++
++// alawDecode 把 G.711 A-law 字节还原成 16bit PCM。
++func alawDecode(b byte) int16 {
++	a := int(b) ^ 0x55
++	t := (a & 0x0F) << 4
++	seg := (a & 0x70) >> 4
++	switch seg {
++	case 0:
++		t += 8
++	case 1:
++		t += 0x108
++	default:
++		t += 0x108
++		t <<= uint(seg - 1)
++	}
++	if a&0x80 != 0 {
++		return int16(t)
++	}
++	return int16(-t)
++}
++
++// audioStats 返回 (RMS, 峰值)，都归一化到 0..1。
++//
++// 必须按 codec 真正解码再算：A-law 的"数字静音"是 0x55/0xD5 交替，直接对字节
++// 统计标准差会有 0.5 的假读数，静音和说话完全分不开（踩过这个坑）。
++// codecPCMA=1027(A-law) / codecPCM=1024(裸 16bit) 都按真实采样算 RMS。
++func audioStats(payload []byte, codecID uint32) (float64, float64) {
++	if len(payload) == 0 {
++		return 0, 0
++	}
++
++	var sum, mx float64
++	n := 0
++	switch codecID {
++	case 1027: // A-law
++		for _, b := range payload {
++			v := float64(alawDecode(b))
++			sum += v * v
++			if v < 0 {
++				v = -v
++			}
++			if v > mx {
++				mx = v
++			}
++			n++
++		}
++	case 1024: // 裸 PCM16LE
++		for i := 0; i+1 < len(payload); i += 2 {
++			v := float64(int16(binary.LittleEndian.Uint16(payload[i:])))
++			sum += v * v
++			if v < 0 {
++				v = -v
++			}
++			if v > mx {
++				mx = v
++			}
++			n++
++		}
++	default: // 其他（OPUS 等）只能按字节粗略估，够判断有没有声音
++		for _, b := range payload {
++			v := int(b)
++			if v > 127 {
++				v -= 256
++			}
++			sum += float64(v * v)
++			n++
++		}
++	}
++	if n == 0 {
++		return 0, 0
++	}
++	return math.Sqrt(sum/float64(n)) / 32768.0, mx / 32768.0
++}
++
++// 摄像头对连接抖动极其敏感：短时间内反复拨号会被它"拉黑"，之后每次都会
++// 在建流后立刻 EOF。所以失败后的冷却必须指数退避，而不是固定几秒。
++const (
++	dialCooldownMin = 8 * time.Second
++	dialCooldownMax = 5 * time.Minute
++)
++
++var (
++	dialMu    sync.Mutex // 串行化拨号
++	userID    = os.Getenv("HEPTZ_USER")
++	passToken = os.Getenv("HEPTZ_TOKEN")
++	region    = envOr("HEPTZ_REGION", "cn")
++	transport = os.Getenv("HEPTZ_TRANSPORT")   // 空 = UDP/TCP 都试，和 go2rtc 默认一致
++	cams      []CamCfg
++	discovered map[string]CamCfg // did -> cfg，从米家云端自动拉取
++	sessions  = map[string]*session{}
++	mu        sync.Mutex
++	cloud     *xiaomi.Cloud
++)
++
++// discover 从米家云端拉设备列表，补全 did -> {ip, model} 映射。
++// HomeEye 侧的配置里只有 did，局域网 IP 和 model 由这里兜底获取。
++func discover() error {
++	cl, err := getCloud()
++	if err != nil {
++		return err
++	}
++	res, err := cl.Request(baseURL(region), "/v2/home/device_list_page", "{}", nil)
++	if err != nil {
++		return err
++	}
++	var v struct {
++		List []struct {
++			Did      string `json:"did"`
++			Name     string `json:"name"`
++			Model    string `json:"model"`
++			LocalIP  string `json:"localip"`
++			IsOnline *bool  `json:"isOnline"`
++		} `json:"list"`
++	}
++	if err = json.Unmarshal(res, &v); err != nil {
++		return err
++	}
++	m := map[string]CamCfg{}
++	for _, d := range v.List {
++		m[d.Did] = CamCfg{
++			Name: d.Name, IP: d.LocalIP, DID: d.Did, Model: d.Model,
++			Online: d.IsOnline,
++		}
++	}
++	mu.Lock()
++	discovered = m
++	mu.Unlock()
++	log.Printf("discovered %d devices from cloud", len(m))
++	return nil
++}
++
++func envOr(k, def string) string {
++	if v := os.Getenv(k); v != "" {
++		return v
++	}
++	return def
++}
++
++func baseURL(region string) string {
++	switch region {
++	case "de", "i2", "ru", "sg", "us":
++		return "https://" + region + ".api.io.mi.com/app"
++	}
++	return "https://api.io.mi.com/app"
++}
++
++func vendorName(i byte) string {
++	switch i {
++	case 1:
++		return "tutk"
++	case 3:
++		return "agora"
++	case 4:
++		return "cs2"
++	case 6:
++		return "mtp"
++	}
++	return fmt.Sprintf("%d", i)
++}
++
++func getCloud() (*xiaomi.Cloud, error) {
++	if cloud != nil {
++		return cloud, nil
++	}
++	c := xiaomi.NewCloud("xiaomiio")
++	if err := c.LoginWithToken(userID, passToken); err != nil {
++		return nil, fmt.Errorf("cloud login: %w", err)
++	}
++	cloud = c
++	return cloud, nil
++}
++
++// buildURL asks the Mi cloud for per-connection P2P parameters and assembles the
++// full xiaomi:// URL that miss.NewClient expects.
++func buildURL(cam CamCfg) (string, error) {
++	cl, err := getCloud()
++	if err != nil {
++		return "", err
++	}
++
++	clientPublic, clientPrivate, err := crypto.GenerateKey()
++	if err != nil {
++		return "", err
++	}
++
++	params := fmt.Sprintf(
++		`{"app_pubkey":"%x","did":"%s","support_vendors":"TUTK_CS2_MTP"}`,
++		clientPublic, cam.DID,
++	)
++
++	res, err := cl.Request(baseURL(region), "/v2/device/miss_get_vendor", params, nil)
++	if err != nil {
++		return "", fmt.Errorf("miss_get_vendor: %w", err)
++	}
++
++	var v struct {
++		Vendor struct {
++			ID     byte `json:"vendor"`
++			Params struct {
++				UID string `json:"p2p_id"`
++			} `json:"vendor_params"`
++		} `json:"vendor"`
++		PublicKey string `json:"public_key"`
++		Sign      string `json:"sign"`
++	}
++	if err = json.Unmarshal(res, &v); err != nil {
++		return "", fmt.Errorf("miss_get_vendor decode: %w (%s)", err, res)
++	}
++
++	q := url.Values{}
++	q.Set("did", cam.DID)
++	q.Set("model", cam.Model)
++	q.Set("client_public", hex.EncodeToString(clientPublic))
++	q.Set("client_private", hex.EncodeToString(clientPrivate))
++	q.Set("device_public", v.PublicKey)
++	q.Set("sign", v.Sign)
++	q.Set("vendor", vendorName(v.Vendor.ID))
++	q.Set("transport", transport)
++	if v.Vendor.ID == 1 {
++		q.Set("uid", v.Vendor.Params.UID)
++	}
++
++	return fmt.Sprintf("xiaomi://%s?%s", cam.IP, q.Encode()), nil
++}
++
++// failDial 记录一次失败的拨号，并给下一次尝试加上指数退避的冷却。
++func failDial(name string, cfg CamCfg, err error, prevFails int) {
++	fails := prevFails + 1
++	d := dialCooldownMin
++	for i := 1; i < fails && d < dialCooldownMax; i++ {
++		d *= 2
++	}
++	if d > dialCooldownMax {
++		d = dialCooldownMax
++	}
++	mu.Lock()
++	sessions[name] = &session{
++		cfg:     cfg,
++		err:     err,
++		fails:   fails,
++		nextTry: time.Now().Add(d),
++	}
++	mu.Unlock()
++	log.Printf("[%s] dial failed (%d in a row), retry in %s", name, fails, d)
++}
++
++// lookupCfg 找出摄像头的 {ip, model}。只读 cams / discovered。
++func lookupCfg(name string) (*CamCfg, error) {
++	for i := range cams {
++		if cams[i].Name == name || cams[i].DID == name {
++			c := cams[i]
++			return &c, nil
++		}
++	}
++
++	mu.Lock()
++	d, ok := discovered[name]
++	mu.Unlock()
++
++	if !ok {
++		if derr := discover(); derr != nil {
++			log.Printf("discover failed: %v", derr)
++		}
++		mu.Lock()
++		d, ok = discovered[name]
++		mu.Unlock()
++	}
++	if !ok || d.IP == "" {
++		return nil, fmt.Errorf("unknown camera: %s", name)
++	}
++	c := d
++	return &c, nil
++}
++
++func getSession(name string) (*session, error) {
++	mu.Lock()
++	cur := sessions[name]
++	mu.Unlock()
++	if cur != nil {
++		if cur.err == nil {
++			cur.lastUse = time.Now()
++			return cur, nil
++		}
++		// 刚断的会话不要立刻重拨：摄像头对并发会话数很敏感，一次失败就连着重拨
++		// 会把它的会话表挤满，接下来所有拨号都只换来一个 EOF（实测踩过）。
++		if wait := time.Until(cur.nextTry); wait > 0 {
++			return nil, fmt.Errorf("会话刚断开（%v），%.0f 秒后自动重试", cur.err, wait.Seconds())
++		}
++	}
++
++	// 拨号串行化：同一时刻只允许一个 dial，其余请求排队复用结果
++	dialMu.Lock()
++	defer dialMu.Unlock()
++	mu.Lock()
++	cur = sessions[name]
++	mu.Unlock()
++	if cur != nil {
++		if cur.err == nil {
++			cur.lastUse = time.Now()
++			return cur, nil
++		}
++		if wait := time.Until(cur.nextTry); wait > 0 {
++			return nil, fmt.Errorf("会话刚断开（%v），%.0f 秒后自动重试", cur.err, wait.Seconds())
++		}
++	}
++
++	prevF := 0
++	if cur != nil {
++		prevF = cur.fails
++	}
++
++	cfg, err := lookupCfg(name)
++	if err != nil {
++		return nil, err
++	}
++
++	// 云端明确标记离线时立刻返回，不要再去等 5~10 秒的 P2P 超时——
++	// 否则用户按一下云台按钮要卡十秒才看到「失败」。
++	if cfg.Online != nil && !*cfg.Online {
++		return nil, fmt.Errorf("offline: 摄像头离线（米家云端状态为离线，局域网 IP %s）", cfg.IP)
++	}
++
++	rawURL, err := buildURL(*cfg)
++	if err != nil {
++		failDial(name, *cfg, err, prevF)
++		return nil, err
++	}
++	log.Printf("[%s] dialing %s", name, rawURL[:min(len(rawURL), 40)])
++
++	// 注意：这一步是整个流程里唯一的长耗时点（UDP 打洞最多 ~10s），
++	// 全程不持锁，避免 /status 被一次失败的拨号卡死。
++	client, err := miss.NewClient(rawURL)
++	if err != nil {
++		failDial(name, *cfg, err, prevF)
++		return nil, fmt.Errorf("dial: %w", err)
++	}
++
++	s := &session{cfg: *cfg, client: client, created: time.Now(), lastUse: time.Now()}
++	mu.Lock()
++	sessions[name] = s
++	mu.Unlock()
++	log.Printf("[%s] connected via %s", name, client.Protocol())
++
++	// 摄像头只有在媒体通道建立后才认 motor 命令：不 StartMedia 的话写进去的
++	// 0x112 会被直接丢弃，紧接着连接被对端断开（表现为 broken pipe）。
++	// quality=1 是低码率子码流。下行音频默认关闭：在 069a01 + 子码流下开音频，
++	// 对端会立刻 EOF 掉整条会话（实测），关掉才稳。
++	mediaQuality := envOr("HEPTZ_MEDIA_QUALITY", "1")
++	mediaAudio := envOr("HEPTZ_MEDIA_AUDIO", "0")
++	if err = client.StartMedia("", mediaQuality, mediaAudio); err != nil {
++		log.Printf("[%s] StartMedia failed: %v", name, err)
++	} else {
++		log.Printf("[%s] media started (q=%s, audio=%s)", name, mediaQuality, mediaAudio)
++	}
++
++	// 读到 EOF/错误说明这条会话已经死了，必须立刻标记，下一条命令才会重新拨号。
++	// 不标记的话后续 motor 会一直往已关闭的 socket 写，永远报 broken pipe。
++	failSession := func(camName string, cause error) {
++		mu.Lock()
++		cur := sessions[camName]
++		if cur != nil && cur.client == client {
++			cur.err = cause
++			cur.fails++
++			d := dialCooldownMin
++			for i := 1; i < cur.fails && d < dialCooldownMax; i++ {
++				d *= 2
++			}
++			if d > dialCooldownMax {
++				d = dialCooldownMax
++			}
++			cur.nextTry = time.Now().Add(d)
++		}
++		mu.Unlock()
++		_ = client.Close()
++	}
++
++	// 必须持续读 channel2（媒体），否则 TCP 接收窗填满后摄像头会阻塞甚至断开
++	go func(c *miss.Client, camName string) {
++		for {
++			pkt, err := c.ReadPacket()
++			if err != nil {
++				log.Printf("[%s] media reader stopped: %v", camName, err)
++				failSession(camName, err)
++				return
++			}
++			switch pkt.CodecID {
++			case 4, 5: // H264 / H265
++				mu.Lock()
++				if cur := sessions[camName]; cur != nil {
++					cur.videoPkts++
++				}
++				mu.Unlock()
++			default: // 音频
++				rms, pk := audioStats(pkt.Payload, pkt.CodecID)
++				mu.Lock()
++				if cur := sessions[camName]; cur != nil {
++					cur.audioPkts++
++					cur.audioLevel = rms
++					if pk > cur.audioPeak {
++						cur.audioPeak = pk
++					}
++				}
++				mu.Unlock()
++			}
++		}
++	}(client, name)
++
++	// 更关键：channel0（命令通道）也必须读。摄像头对 motor 命令会回 cmdMotorRes
++	// (0x113)，缓冲区只有 10 个槽，不读就会灌满 -> Push 失败 -> worker 退出 ->
++	// 整条连接被关闭，下一条命令就报 broken pipe。
++	go func(c *miss.Client, camName string) {
++		for {
++			cmd, data, err := c.ReadCommand()
++			if err != nil {
++				log.Printf("[%s] cmd reader stopped: %v", camName, err)
++				failSession(camName, err)
++				return
++			}
++			plain := c.DecodeCommand(data)
++			log.Printf("[%s] <- cmd=0x%03x %s", camName, cmd, plain)
++			// 记录最后一次回包，方便 /status 排障（对讲就是靠 0x107 判断喇叭开没开）
++			mu.Lock()
++			if cur := sessions[camName]; cur != nil {
++				cur.lastRes = string(plain)
++				cur.lastCmd = cmd
++			}
++			mu.Unlock()
++		}
++	}(client, name)
++
++	return s, nil
++}
++
++func min(a, b int) int {
++	if a < b {
++		return a
++	}
++	return b
++}
++
++// ---- HTTP ----
++
++func apiPTZ(w http.ResponseWriter, r *http.Request) {
++	q := r.URL.Query()
++	name := q.Get("cam")
++	opStr := q.Get("op")
++	op, err := strconv.Atoi(opStr)
++	if err != nil || op < 0 || op > 15 {
++		http.Error(w, "bad op (0 stop,1 left,2 right,3 up,4 down)", http.StatusBadRequest)
++		return
++	}
++
++	s, err := getSession(name)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	if err = s.client.Motor(op); err != nil {
++		// 连接可能已死，标记一下，下次调用重连
++		mu.Lock()
++		sessions[name] = &session{cfg: s.cfg, err: err}
++		mu.Unlock()
++		http.Error(w, "motor: "+err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	mu.Lock()
++	s.moves++
++	s.lastOp = op
++	s.lastUse = time.Now()
++	moves := s.moves
++	mu.Unlock()
++
++	writeJSON(w, map[string]any{
++		"ok": true, "cam": name, "op": op, "moves": moves,
++		"protocol": s.client.Protocol(),
++	})
++}
++
++func apiStatus(w http.ResponseWriter, r *http.Request) {
++	mu.Lock()
++	defer mu.Unlock()
++
++	out := map[string]any{}
++	names := map[string]CamCfg{}
++	for _, c := range cams {
++		names[c.DID] = c
++	}
++	for did, c := range discovered {
++		names[did] = c
++	}
++	for did, c := range names {
++		s := sessions[did]
++		item := map[string]any{"name": c.Name, "model": c.Model, "ip": c.IP}
++		if c.Online != nil {
++			item["online"] = *c.Online
++		}
++		if talking, outBytes, frames, inBytes := talkSnapshot(did); talking || frames > 0 {
++			item["talking"] = talking
++			item["talkOut"] = outBytes
++			item["talkFrames"] = frames
++			item["talkIn"] = inBytes
++		}
++		if s == nil {
++			item["state"] = "idle"
++			out[did] = item
++			continue
++		}
++		item["moves"] = s.moves
++		item["lastOp"] = s.lastOp
++		item["videoPkts"] = s.videoPkts
++		item["audioPkts"] = s.audioPkts
++		item["audioLevel"] = fmt.Sprintf("%.3f", s.audioLevel)
++		item["audioPeak"] = fmt.Sprintf("%.3f", s.audioPeak)
++		if s.lastCmd != 0 {
++			item["lastCmd"] = fmt.Sprintf("0x%03x", s.lastCmd)
++		}
++		if s.lastRes != "" {
++			item["motorRes"] = s.lastRes
++		}
++		if s.err != nil {
++			item["state"] = "error"
++			item["error"] = s.err.Error()
++			if wait := time.Until(s.nextTry); wait > 0 {
++				item["retryIn"] = int(wait.Seconds()) + 1
++			}
++		} else {
++			item["state"] = "connected"
++			item["protocol"] = s.client.Protocol()
++			item["age"] = int(time.Since(s.created).Seconds())
++		}
++		out[did] = item
++	}
++	writeJSON(w, out)
++}
++
++func apiReconnect(w http.ResponseWriter, r *http.Request) {
++	name := r.URL.Query().Get("cam")
++	mu.Lock()
++	defer mu.Unlock()
++	if s := sessions[name]; s != nil && s.client != nil {
++		_ = s.client.Close()
++	}
++	delete(sessions, name)
++	writeJSON(w, map[string]any{"ok": true, "cam": name})
++}
++
++func writeJSON(w http.ResponseWriter, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(v)
++}
++
++// touchSession 刷新会话的最后使用时间，防止空闲回收器把正在用的会话掐掉。
++func touchSession(name string) {
++	mu.Lock()
++	if s := sessions[name]; s != nil {
++		s.lastUse = time.Now()
++	}
++	mu.Unlock()
++}
++
++// idleReaper 定期回收空闲会话。
++//
++// 为什么必须有：摄像头（小米 P2P）的并发会话上限实测是 3 条。同一个 NAS 上
++// 通常已经有 HomeEye 自己的取流会话（1 条）和 go2rtc 的会话（1 条），云台侧车
++// 再占 1 条正好卡满。此时任何一方重连失败，就会出现「互相把对方踢掉」的
++// 死循环（表现是 cs2: EOF）。
++//
++// 所以侧车不能常驻占位：闲置一段时间就主动断开，把名额还给取流。
++// 用户下次按云台按钮时再重新拨号（UDP 打洞约 1 秒，用户无感）。
++func idleReaper() {
++	timeout := time.Duration(envInt("HEPTZ_IDLE_SECONDS", 45)) * time.Second
++	if timeout <= 0 {
++		log.Printf("idle reaper disabled")
++		return
++	}
++	log.Printf("idle reaper: sessions released after %s of inactivity", timeout)
++
++	tick := timeout / 3
++	if tick < 5*time.Second {
++		tick = 5 * time.Second
++	}
++	for range time.Tick(tick) {
++		mu.Lock()
++		var drop []*session
++		now := time.Now()
++		for name, s := range sessions {
++			if s.client == nil || s.err != nil {
++				continue
++			}
++			// 对讲进行中不能回收，否则会把用户的语音掐断
++			if t := talks[name]; t != nil && t.active {
++				continue
++			}
++			if now.Sub(s.lastUse) > timeout {
++				drop = append(drop, s)
++				delete(sessions, name)
++			}
++		}
++		mu.Unlock()
++
++		for _, s := range drop {
++			log.Printf("[%s] idle %s, releasing session", s.cfg.DID, timeout)
++			_ = s.client.Close()
++		}
++	}
++}
++
++// envInt 读整数环境变量，缺省或非法时返回 def。
++func envInt(name string, def int) int {
++	v := strings.TrimSpace(os.Getenv(name))
++	if v == "" {
++		return def
++	}
++	n, err := strconv.Atoi(v)
++	if err != nil {
++		return def
++	}
++	return n
++}
++
++func main() {
++	if userID == "" || passToken == "" {
++		log.Fatal("HEPTZ_USER / HEPTZ_TOKEN required")
++	}
++	if raw := os.Getenv("HEPTZ_CAMS"); raw != "" {
++		if err := json.Unmarshal([]byte(raw), &cams); err != nil {
++			log.Fatalf("HEPTZ_CAMS: %v", err)
++		}
++	}
++
++	if _, err := getCloud(); err != nil {
++		log.Printf("warn: cloud prewarm failed: %v", err)
++	} else {
++		log.Printf("cloud ready, user=%s region=%s, %d local cams", userID, region, len(cams))
++		if derr := discover(); derr != nil {
++			log.Printf("discover failed: %v", derr)
++		}
++	}
++
++	addr := envOr("HEPTZ_ADDR", "0.0.0.0:8899")
++	mux := http.NewServeMux()
++	mux.HandleFunc("/ptz", apiPTZ)
++	mux.HandleFunc("/status", apiStatus)
++	mux.HandleFunc("/reconnect", apiReconnect)
++	mux.HandleFunc("/talk/start", apiTalkStart)
++	mux.HandleFunc("/talk/stop", apiTalkStop)
++	mux.HandleFunc("/talk/mic", apiTalkMic)
++	mux.HandleFunc("/talk", apiTalkPush)
++	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
++		w.Write([]byte("ok"))
++	})
++
++	go talkJanitor()
++	go idleReaper()
++
++	log.Printf("heptz listening on %s", addr)
++	if err := http.ListenAndServe(addr, mux); err != nil {
++		log.Fatal(err)
++	}
++}
+diff --git a/cmd/heptz/talk.go b/cmd/heptz/talk.go
+new file mode 100644
+index 0000000..01d7922
+--- /dev/null
++++ b/cmd/heptz/talk.go
+@@ -0,0 +1,301 @@
++// 对讲（摄像头上行语音）通道。
++//
++// 链路：浏览器麦克风 -> HomeEye -> 本进程（A-law 编码 + 40ms 分帧）->
++//       miss channel3 -> 摄像头喇叭。
++//
++// 摄像头只认「PCMA / 8kHz / 每包 40ms」这种最朴素的送法（Go2rtc 也是这么干的），
++// 所以这里固定把输入规整成 16bit 8kHz 单声道，再由本进程转 A-law。
++package main
++
++import (
++	"encoding/binary"
++	"io"
++	"log"
++	"net/http"
++	"sync"
++	"time"
++)
++
++// 40ms @ 8kHz：320 个采样
++const (
++	pcmFrameBytes = 320 * 2 // 16bit -> 640
++	alawFrameSize = 320     // 8bit  -> 320
++	talkIdleStop  = 8 * time.Second
++)
++
++type talkState struct {
++	mu     sync.Mutex
++	buf    []byte // 还没凑满 40ms 的 PCM16 余量
++	active bool
++	sent   int // 已写出的 A-law 字节数
++	frames int
++	in     int // 收到的 PCM16 字节数
++	lastIn time.Time
++}
++
++var (
++	talksMu sync.Mutex
++	talks   = map[string]*talkState{}
++)
++
++func getTalk(name string) *talkState {
++	talksMu.Lock()
++	defer talksMu.Unlock()
++	t := talks[name]
++	if t == nil {
++		t = &talkState{}
++		talks[name] = t
++	}
++	return t
++}
++
++// talkSnapshot 给 /status 用的只读快照。
++func talkSnapshot(name string) (active bool, outBytes, frames, inBytes int) {
++	talksMu.Lock()
++	t := talks[name]
++	talksMu.Unlock()
++	if t == nil {
++		return false, 0, 0, 0
++	}
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return t.active, t.sent, t.frames, t.in
++}
++
++// ---- G.711 A-law 编码（Sun/CCITT 参考实现，输入按 13bit 处理） ----
++
++var alawSegEnd = [8]int16{0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF}
++
++func alawSearch(v int16) int {
++	for i := 0; i < 8; i++ {
++		if v <= alawSegEnd[i] {
++			return i
++		}
++	}
++	return 8
++}
++
++func alawEncodeSample(pcm int16) byte {
++	v := pcm >> 3
++	var mask byte
++	if v >= 0 {
++		mask = 0xD5
++	} else {
++		mask = 0x55
++		v = -v - 1
++	}
++	seg := alawSearch(v)
++	if seg >= 8 {
++		return 0x7F ^ mask
++	}
++	aval := byte(seg) << 4
++	if seg < 2 {
++		aval |= byte(v>>1) & 0x0F
++	} else {
++		aval |= byte(v>>uint(seg)) & 0x0F
++	}
++	return aval ^ mask
++}
++
++func alawEncode(pcm []byte) []byte {
++	n := len(pcm) / 2
++	out := make([]byte, n)
++	for i := 0; i < n; i++ {
++		out[i] = alawEncodeSample(int16(binary.LittleEndian.Uint16(pcm[i*2:])))
++	}
++	return out
++}
++
++// ---- HTTP ----
++
++// apiTalkStart 打开喇叭通道。摄像头回 0x107 才代表真的开了。
++func apiTalkStart(w http.ResponseWriter, r *http.Request) {
++	name := r.URL.Query().Get("cam")
++
++	s, err := getSession(name)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	t := getTalk(name)
++	t.mu.Lock()
++	t.buf = nil
++	t.sent, t.frames, t.in = 0, 0, 0
++	t.active = true
++	t.lastIn = time.Now()
++	t.mu.Unlock()
++
++	// 对讲期间会话不能被空闲回收器掐断
++	touchSession(name)
++
++	if err = s.client.StartSpeaker(); err != nil {
++		t.mu.Lock()
++		t.active = false
++		t.mu.Unlock()
++		http.Error(w, "speaker start: "+err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	// 官方 App 打开喇叭通道后会空一小会儿再推音频，照做更稳。
++	time.Sleep(300 * time.Millisecond)
++
++	log.Printf("[%s] talk started (%s)", name, s.client.SpeakerCodecName())
++	writeJSON(w, map[string]any{
++		"ok": true, "cam": name, "codec": s.client.SpeakerCodecName(),
++	})
++}
++
++// apiTalkPush 接收裸 PCM16LE / 8kHz / 单声道，切帧后写到 channel3。
++func apiTalkPush(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "POST required", http.StatusMethodNotAllowed)
++		return
++	}
++	name := r.URL.Query().Get("cam")
++
++	s, err := getSession(name)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
++	if err != nil {
++		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
++		return
++	}
++	if len(body) == 0 {
++		writeJSON(w, map[string]any{"ok": true, "frames": 0})
++		return
++	}
++
++	t := getTalk(name)
++	t.mu.Lock()
++	t.in += len(body)
++	t.lastIn = time.Now()
++	t.buf = append(t.buf, body...)
++	var frames [][]byte
++	for len(t.buf) >= pcmFrameBytes {
++		frames = append(frames, append([]byte(nil), t.buf[:pcmFrameBytes]...))
++		t.buf = t.buf[pcmFrameBytes:]
++	}
++	t.mu.Unlock()
++
++	touchSession(name)
++
++	codec := s.client.SpeakerCodecID()
++	written := 0
++	for _, f := range frames {
++		var out []byte
++		if codec == 1024 { // codecPCM：Dafang/小方这类裸 PCM16 机型，直接透传
++			out = f
++		} else {
++			out = alawEncode(f)
++		}
++		if err = s.client.WriteAudio(codec, out); err != nil {
++			log.Printf("[%s] talk write failed: %v", name, err)
++			t.mu.Lock()
++			t.active = false
++			t.mu.Unlock()
++			http.Error(w, "write audio: "+err.Error(), http.StatusBadGateway)
++			return
++		}
++		written += len(out)
++	}
++
++	t.mu.Lock()
++	t.sent += written
++	t.frames += len(frames)
++	sent, total := t.sent, t.frames
++	t.mu.Unlock()
++
++	writeJSON(w, map[string]any{
++		"ok": true, "frames": len(frames), "bytes": written,
++		"total_frames": total, "total_bytes": sent,
++	})
++}
++
++// apiTalkStop 关闭喇叭通道。
++func apiTalkStop(w http.ResponseWriter, r *http.Request) {
++	name := r.URL.Query().Get("cam")
++
++	t := getTalk(name)
++	t.mu.Lock()
++	t.active = false
++	sent, frames, in := t.sent, t.frames, t.in
++	t.buf = nil
++	t.mu.Unlock()
++
++	mu.Lock()
++	s := sessions[name]
++	mu.Unlock()
++
++	if s != nil && s.err == nil && s.client != nil {
++		if err := s.client.StopSpeaker(); err != nil {
++			log.Printf("[%s] speaker stop: %v", name, err)
++		}
++	}
++	log.Printf("[%s] talk stopped (in=%dB out=%dB frames=%d)", name, in, sent, frames)
++
++	writeJSON(w, map[string]any{
++		"ok": true, "cam": name, "in_bytes": in, "out_bytes": sent, "frames": frames,
++	})
++}
++
++// apiTalkMic 显式开/关摄像头麦克风，用来区分"喇叭没出声"和"麦克风没开"。
++func apiTalkMic(w http.ResponseWriter, r *http.Request) {
++	name := r.URL.Query().Get("cam")
++	s, err := getSession(name)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++	on := r.URL.Query().Get("on") != "0"
++	if on {
++		err = s.client.StartMic()
++	} else {
++		err = s.client.StopMic()
++	}
++	if err != nil {
++		http.Error(w, "mic: "+err.Error(), http.StatusBadGateway)
++		return
++	}
++	log.Printf("[%s] mic (0x104) on=%v", name, on)
++	writeJSON(w, map[string]any{"ok": true, "cam": name, "on": on})
++}
++
++// talkJanitor 兜底：浏览器卡死/断网时前端来不及发 stop，8 秒静默后自动关通道，
++// 否则摄像头喇叭会一直占着（还会把环境音回放出来）。
++func talkJanitor() {
++	for range time.Tick(2 * time.Second) {
++		now := time.Now()
++
++		talksMu.Lock()
++		names := make([]string, 0, len(talks))
++		for n := range talks {
++			names = append(names, n)
++		}
++		talksMu.Unlock()
++
++		for _, name := range names {
++			t := getTalk(name)
++			t.mu.Lock()
++			idle := t.active && now.Sub(t.lastIn) > talkIdleStop
++			if idle {
++				t.active = false
++			}
++			t.mu.Unlock()
++			if !idle {
++				continue
++			}
++			mu.Lock()
++			s := sessions[name]
++			mu.Unlock()
++			if s != nil && s.err == nil && s.client != nil {
++				_ = s.client.StopSpeaker()
++			}
++			log.Printf("[%s] talk auto-stopped after idle", name)
++		}
++	}
++}
+diff --git a/internal/xiaomi/ptz.go b/internal/xiaomi/ptz.go
+new file mode 100644
+index 0000000..84bca7b
+--- /dev/null
++++ b/internal/xiaomi/ptz.go
+@@ -0,0 +1,253 @@
++package xiaomi
++
++import (
++	"encoding/binary"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strconv"
++	"sync"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/api"
++	"github.com/AlexxIT/go2rtc/pkg/pcm"
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi/miss"
++)
++
++// 云台 / 对讲接口。
++//
++// 设计要点：这些命令**不新建 P2P 会话**，而是在 go2rtc 已经为这路流建立的
++// 那条 miss 会话上下发（见 pkg/xiaomi/miss/registry.go）。原因很实在：
++// 小米摄像头的并发会话上限只有 3 条，如果 HomeEye 另开一条去发云台命令，
++// 摄像头的会话表就会挤满，结果是所有人互相把对方踢掉（cs2: EOF）。
++//
++// 用法：
++//   GET  /api/xiaomi/motor?did=1234567890&op=1     op: 1右 2左 3上 4下 0停
++//   POST /api/xiaomi/speaker?did=1234567890         打开对讲通道
++//   POST /api/xiaomi/audio?did=1234567890           body = 裸 A-law/PCM16
++//   POST /api/xiaomi/speaker/stop?did=1234567890    关闭对讲通道
++
++// talkBuf 攒音频用：A-law 8k 一帧 40ms = 320 字节。
++const talkFrameBytes = 320
++
++var (
++	talkMu    sync.Mutex
++	talkState = map[string]*talkBufState{}
++)
++
++type talkBufState struct {
++	buf    []byte
++	active bool
++	frames int
++	bytes  int
++}
++
++// apiXiaomiMotor 云台控制。
++func apiXiaomiMotor(w http.ResponseWriter, r *http.Request) {
++	q := r.URL.Query()
++
++	did := q.Get("did")
++	if did == "" {
++		http.Error(w, "missing did", http.StatusBadRequest)
++		return
++	}
++
++	opStr := q.Get("op")
++	op, err := strconv.Atoi(opStr)
++	if err != nil || op < 0 || op > 15 {
++		http.Error(w, "bad op (0 stop, 1 right, 2 left, 3 up, 4 down)", http.StatusBadRequest)
++		return
++	}
++
++	// 先记下当前回包计数，再发命令，最后等一个新的 cmdMotorRes。
++	// 摄像头回的 0x113 里带 {"angle":..,"elevation":..}，是真实朝向。
++	seq := miss.Clients.MotorSeq(did)
++
++	if err = miss.Clients.Motor(did, op); err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	log.Info().Msgf("[xiaomi] motor did=%s op=%d", did, op)
++
++	// 转到位大概要几百毫秒，最多等 1.2 秒。
++	angle, elev, ok := miss.Clients.WaitMotor(did, seq, 1200*time.Millisecond)
++
++	out := map[string]any{"ok": true, "did": did, "op": op}
++	if ok {
++		out["angle"] = angle
++		out["elevation"] = elev
++	}
++	api.ResponseJSON(w, out)
++}
++
++// apiXiaomiSpeaker 打开/关闭对讲通道。
++func apiXiaomiSpeaker(w http.ResponseWriter, r *http.Request) {
++	did := r.URL.Query().Get("did")
++	if did == "" {
++		http.Error(w, "missing did", http.StatusBadRequest)
++		return
++	}
++
++	if r.URL.Query().Get("stop") != "" {
++		_ = miss.Clients.StopSpeaker(did)
++		talkMu.Lock()
++		delete(talkState, did)
++		talkMu.Unlock()
++		api.ResponseJSON(w, map[string]any{"ok": true, "did": did, "talking": false})
++		return
++	}
++
++	codec, name, err := miss.Clients.SpeakerCodec(did)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	if err = miss.Clients.StartSpeaker(did); err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	talkMu.Lock()
++	talkState[did] = &talkBufState{active: true}
++	talkMu.Unlock()
++
++	// 官方 App 打开喇叭后空一小会儿再推音频，照做更稳
++	time.Sleep(300 * time.Millisecond)
++
++	log.Info().Msgf("[xiaomi] speaker start did=%s codec=%s", did, name)
++	api.ResponseJSON(w, map[string]any{"ok": true, "did": did, "codec": name, "codecID": codec})
++}
++
++// apiXiaomiAudio 接收对讲音频。
++//
++// body 约定：**PCM16 / 小端 / 8kHz / 单声道**（浏览器 getUserMedia 出来的就是这个）。
++// 由 go2rtc 这边转成摄像头要的格式：
++//   * PCMA（G.711 A-law，8bit/8k）机型 —— 转成 A-law，一帧 40ms = 320 字节
++//   * PCM16 机型 —— 原样送，一帧 40ms = 640 字节
++//   * OPUS 机型 —— 暂不支持
++//
++// 之前这里假设「调用方送来的已经是摄像头原生格式」，结果 PCM16 被当 A-law 切帧，
++// 摄像头那边收到的是乱码（声音又尖又快）。
++func apiXiaomiAudio(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		http.Error(w, "POST required", http.StatusMethodNotAllowed)
++		return
++	}
++
++	did := r.URL.Query().Get("did")
++	if did == "" {
++		http.Error(w, "missing did", http.StatusBadRequest)
++		return
++	}
++
++	codec, _, err := miss.Clients.SpeakerCodec(did)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	body, err := io.ReadAll(io.LimitReader(r.Body, 512*1024))
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++	if len(body) == 0 {
++		api.ResponseJSON(w, map[string]any{"ok": true, "frames": 0})
++		return
++	}
++
++	inBytes := len(body)
++
++	var frameBytes int
++	switch codec {
++	case 1027: // PCMA
++		body = pcm16ToPCMA(body)
++		frameBytes = talkFrameBytes
++	case 1024: // PCM16
++		frameBytes = talkFrameBytes * 2
++	default:
++		http.Error(w, "unsupported talk codec for this camera", http.StatusBadRequest)
++		return
++	}
++
++	talkMu.Lock()
++	st := talkState[did]
++	if st == nil {
++		st = &talkBufState{active: true}
++		talkState[did] = st
++	}
++	st.buf = append(st.buf, body...)
++	var frames [][]byte
++	for len(st.buf) >= frameBytes {
++		frames = append(frames, append([]byte(nil), st.buf[:frameBytes]...))
++		st.buf = st.buf[frameBytes:]
++	}
++	talkMu.Unlock()
++
++	for _, f := range frames {
++		if err = miss.Clients.WriteAudio(did, codec, f); err != nil {
++			http.Error(w, "write audio: "+err.Error(), http.StatusBadGateway)
++			return
++		}
++	}
++
++	talkMu.Lock()
++	st.frames += len(frames)
++	st.bytes += inBytes
++	framesOut, bytesOut := st.frames, st.bytes
++	talkMu.Unlock()
++
++	api.ResponseJSON(w, map[string]any{
++		"ok": true, "frames": framesOut, "bytes": bytesOut,
++		"frameBytes": frameBytes,
++	})
++}
++
++// pcm16ToPCMA 把 16bit 小端 PCM 转成 G.711 A-law。
++func pcm16ToPCMA(src []byte) []byte {
++	n := len(src) / 2
++	out := make([]byte, n)
++	for i := 0; i < n; i++ {
++		v := int16(binary.LittleEndian.Uint16(src[i*2:]))
++		out[i] = pcm.PCMtoPCMA(v)
++	}
++	return out
++}
++
++// apiXiaomiStatus 查询云台/对讲的可用状态（供 HomeEye 探测）。
++func apiXiaomiStatus(w http.ResponseWriter, r *http.Request) {
++	dids := miss.Clients.Dids()
++	out := map[string]any{}
++	for _, did := range dids {
++		codec, name, err := miss.Clients.SpeakerCodec(did)
++		if err != nil {
++			// 连接已死，清理掉
++			continue
++		}
++		item := map[string]any{
++			"session": true,
++			"codec":   name,
++			"codecID": codec,
++		}
++		if angle, elev, ok := miss.Clients.MotorState(did); ok {
++			item["angle"] = angle
++			item["elevation"] = elev
++		}
++		if cmd, msg, raw := miss.Clients.LastCommand(did); cmd != 0 {
++			item["lastCmd"] = cmd
++			item["lastMsg"] = msg
++			item["lastRaw"] = raw
++		}
++		talkMu.Lock()
++		st := talkState[did]
++		if st != nil {
++			item["talkFrames"] = st.frames
++			item["talkBytes"] = st.bytes
++		}
++		talkMu.Unlock()
++		out[did] = item
++	}
++	_ = json.NewEncoder(w).Encode(out)
++}
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 1e57842..1bb7a96 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -48,6 +48,10 @@ func Init() {
+ 	})
+ 
+ 	api.HandleFunc("api/xiaomi", apiXiaomi)
++	api.HandleFunc("api/xiaomi/motor", apiXiaomiMotor)
++	api.HandleFunc("api/xiaomi/speaker", apiXiaomiSpeaker)
++	api.HandleFunc("api/xiaomi/audio", apiXiaomiAudio)
++	api.HandleFunc("api/xiaomi/ptz", apiXiaomiStatus)
+ }
+ 
+ var log zerolog.Logger
+diff --git a/pkg/xiaomi/miss/client.go b/pkg/xiaomi/miss/client.go
+index 3113632..781d9f2 100644
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -72,6 +72,9 @@ func NewClient(rawURL string) (*Client, error) {
+ 		return nil, err
+ 	}
+ 
++	// 注意：这里**不**自动启动命令通道读取协程。
++	// cmd/heptz 侧车自己有读取协程，两个协程抢同一条 channel0 会把回包分走。
++	// go2rtc 侧由 producer.Dial() 显式调用 StartCommandReader()。
+ 	return &Client{Conn: conn, key: key, model: model}, nil
+ }
+ 
+@@ -79,6 +82,7 @@ type Client struct {
+ 	Conn
+ 	key   []byte
+ 	model string
++	cr    *cmdReader // 命令通道读取协程（见 cmdreader.go）
+ }
+ 
+ const (
+diff --git a/pkg/xiaomi/miss/cmdreader.go b/pkg/xiaomi/miss/cmdreader.go
+new file mode 100644
+index 0000000..2d4bbb7
+--- /dev/null
++++ b/pkg/xiaomi/miss/cmdreader.go
+@@ -0,0 +1,223 @@
++package miss
++
++import (
++	"encoding/binary"
++	"encoding/hex"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// 命令通道（channel 0）必须有人持续读走。
++//
++// 摄像头对每一条命令都会回一个应答（云台 0x112→0x113、对讲 0x106→0x107 …），
++// 而 channel0 的接收缓冲区只有 10 个槽。没人读的话，灌满之后
++// cs2.dataChannel.Push 会返回 "pop buffer is full"，
++// cs2 的 worker 直接退出 —— 整条 P2P 连接被关闭，
++// 之后所有命令都会报 broken pipe / cs2: EOF。
++//
++// 这个协程顺带把云台回包 cmdMotorRes(0x113) 里的角度记下来，
++// 好让 /api/xiaomi/motor 和 /api/xiaomi/ptz 能回显摄像头当前朝向。
++type cmdReader struct {
++	mu       sync.Mutex
++	angle    int
++	elev     int
++	hasPos   bool
++	motorSeq uint64 // 每收到一个 cmdMotorRes 就 +1，用来判断「是不是新的回包」
++	lastCmd  uint32
++	lastMsg  string
++	lastRaw  string
++}
++
++// 已知的应答命令码。用来在原始缓冲区里定位 cmd 的位置
++// （小米摄像头的回包在 cmd 前面还带 4 个字节，而且 cmd 是大端的）。
++var knownCmdRes = map[uint32]bool{
++	0x101: true, // authRes
++	0x107: true, // speakerStartRes
++	0x10A: true, // streamCtrlRes
++	0x10C: true, // audioFormatRes
++	0x10E: true, // playbackRes
++	0x111: true, // devInfoRes
++	0x113: true, // motorRes
++}
++
++// 通道 0 弹出缓冲区布局是：[4 字节 cmd(大端)][加密的 body]。
++// 外层 cmd 一般是 0x1001（cmdEncoded，表示 body 是加密的）。
++//
++// 解密后的 body 才是真正的应答：[4 字节 命令号(大端)][负载]。
++// 比如云台回包解密后是 00 00 01 13 + {"ret":..,"angle":..,"elevation":..}。
++func splitCmd(buf []byte) (uint32, []byte) {
++	if len(buf) < 4 {
++		return 0, buf
++	}
++	return binary.BigEndian.Uint32(buf[:4]), buf[4:]
++}
++
++// rawCommandReader 可选接口：底层能拿到未经拆分的原始命令缓冲区。
++type rawCommandReader interface {
++	ReadCommandRaw() ([]byte, bool)
++}
++
++func (r *cmdReader) onCommand(cmd uint32, plain []byte, raw []byte) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	r.lastCmd = cmd
++	r.lastMsg = string(plain)
++	r.lastRaw = hex.EncodeToString(raw)
++
++	if cmd != cmdMotorRes {
++		return
++	}
++
++	r.motorSeq++
++
++	if a, ok := jsonInt(r.lastMsg, "angle"); ok {
++		r.angle = a
++		if e, ok2 := jsonInt(r.lastMsg, "elevation"); ok2 {
++			r.elev = e
++		}
++		r.hasPos = true
++	}
++}
++
++func (r *cmdReader) snapshot() (seq uint64, angle, elev int, has bool) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.motorSeq, r.angle, r.elev, r.hasPos
++}
++
++func (r *cmdReader) last() (cmd uint32, msg, raw string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.lastCmd, r.lastMsg, r.lastRaw
++}
++
++// jsonInt 从一段 JSON 文本里取某个整数字段。
++// 不用 encoding/json 是因为回包结构不完全固定（有的带 ret，有的直接是对象），
++// 宽松一点匹配更稳。
++func jsonInt(s, key string) (int, bool) {
++	i := strings.Index(s, "\""+key+"\"")
++	if i < 0 {
++		return 0, false
++	}
++	j := i + len(key) + 2
++	for j < len(s) && (s[j] == ' ' || s[j] == ':') {
++		j++
++	}
++	neg := false
++	if j < len(s) && s[j] == '-' {
++		neg = true
++		j++
++	}
++	start := j
++	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
++		j++
++	}
++	if j == start {
++		return 0, false
++	}
++	n, err := strconv.Atoi(s[start:j])
++	if err != nil {
++		return 0, false
++	}
++	if neg {
++		n = -n
++	}
++	return n, true
++}
++
++// looksJSON 粗判一段字节是不是 JSON 文本。
++func looksJSON(b []byte) bool {
++	return strings.Contains(string(b), "{")
++}
++
++// StartCommandReader 启动命令通道读取协程。
++//
++// 只对 cs2 打开：tutk 的命令通道由它自己的流程消费，
++// 额外再读会抢消息。
++func (c *Client) StartCommandReader() {
++	if c.cr != nil {
++		return
++	}
++	c.cr = &cmdReader{}
++
++	raw, ok := c.Conn.(rawCommandReader)
++	if !ok || !strings.HasPrefix(c.Conn.Protocol(), "cs2") {
++		return
++	}
++
++	go func(c *Client, raw rawCommandReader) {
++		for {
++			buf, ok := raw.ReadCommandRaw()
++			if !ok {
++				// 连接断了就退出；外层 producer 会感知到并重连。
++				return
++			}
++
++			outerCmd, body := splitCmd(buf)
++
++			// body 多数是加密的；解密失败就退回原始字节，
++			// 别把本来能读的 JSON 弄成乱码。
++			plain := c.DecodeCommand(body)
++			if !looksJSON(plain) && looksJSON(body) {
++				plain = body
++			}
++
++			// 解密后的 body 前面 4 个字节才是**真正的**命令号（大端），
++			// 后面是负载（多半是 JSON）。
++			cmd, payload := outerCmd, plain
++			if len(plain) >= 4 {
++				if sub := binary.BigEndian.Uint32(plain[:4]); knownCmdRes[sub] {
++					cmd = sub
++					payload = plain[4:]
++				}
++			}
++
++			c.cr.onCommand(cmd, payload, buf)
++		}
++	}(c, raw)
++}
++
++// MotorState 返回最近一次云台回包里的角度（水平 / 俯仰）。
++func (c *Client) MotorState() (angle, elev int, ok bool) {
++	if c.cr == nil {
++		return 0, 0, false
++	}
++	_, a, e, has := c.cr.snapshot()
++	return a, e, has
++}
++
++// MotorSeq 返回已收到的 cmdMotorRes 计数（用来判断回包是不是新来的）。
++func (c *Client) MotorSeq() uint64 {
++	if c.cr == nil {
++		return 0
++	}
++	seq, _, _, _ := c.cr.snapshot()
++	return seq
++}
++
++// WaitMotor 等一个新的云台回包，返回角度。
++func (c *Client) WaitMotor(prev uint64, timeout time.Duration) (angle, elev int, ok bool) {
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if c.cr == nil {
++			return 0, 0, false
++		}
++		seq, a, e, has := c.cr.snapshot()
++		if seq > prev && has {
++			return a, e, true
++		}
++		time.Sleep(40 * time.Millisecond)
++	}
++	return 0, 0, false
++}
++
++// LastCommand 返回最近一条命令应答（排障用）。
++func (c *Client) LastCommand() (uint32, string, string) {
++	if c.cr == nil {
++		return 0, "", ""
++	}
++	return c.cr.last()
++}
+diff --git a/pkg/xiaomi/miss/cs2/conn.go b/pkg/xiaomi/miss/cs2/conn.go
+index 2c1b395..2ed2716 100644
+--- a/pkg/xiaomi/miss/cs2/conn.go
++++ b/pkg/xiaomi/miss/cs2/conn.go
+@@ -43,6 +43,8 @@ type Conn struct {
+ 
+ 	cmdMu  sync.Mutex
+ 	cmdAck func()
++
++	pktMu sync.Mutex // 对讲上行会从 HTTP handler 并发写 channel3，需要串行化
+ }
+ 
+ const (
+@@ -202,6 +204,15 @@ func (c *Conn) ReadCommand() (cmd uint32, data []byte, err error) {
+ 	return
+ }
+ 
++// ReadCommandRaw 返回未经拆分的原始命令缓冲区。
++//
++// 上层（miss 包的命令读取协程）需要自己判断应答帧的布局：
++// 实测小米摄像头的回包在 cmd 前面还有 4 个字节，
++// 而且 cmd 是**大端**的，所以不能靠固定偏移猜。
++func (c *Conn) ReadCommandRaw() ([]byte, bool) {
++	return c.channels[0].Pop()
++}
++
+ func (c *Conn) WriteCommand(cmd uint32, data []byte) error {
+ 	c.cmdMu.Lock()
+ 	defer c.cmdMu.Unlock()
+@@ -253,6 +264,9 @@ func (c *Conn) ReadPacket() (hdr, payload []byte, err error) {
+ func (c *Conn) WritePacket(hdr, payload []byte) error {
+ 	const offset = 12
+ 
++	c.pktMu.Lock()
++	defer c.pktMu.Unlock()
++
+ 	n := hdrSize + uint32(len(payload))
+ 	req := make([]byte, n+offset)
+ 	req[0] = magic
+@@ -265,7 +279,9 @@ func (c *Conn) WritePacket(hdr, payload []byte) error {
+ 	c.seqCh3++
+ 	binary.BigEndian.PutUint32(req[8:], n)
+ 	copy(req[offset:], hdr)
+-	copy(req[offset+hdrSize:], hdr)
++	// 上游 go2rtc 这里写成了 copy(req[offset+hdrSize:], hdr)，payload 从来没被发出去，
++	// 结果是 channel3 上空包 —— 对讲永远没有声音。改成 payload 才真正能出声。
++	copy(req[offset+hdrSize:], payload)
+ 
+ 	_, err := c.Conn.Write(req)
+ 	return err
+diff --git a/pkg/xiaomi/miss/motor.go b/pkg/xiaomi/miss/motor.go
+new file mode 100644
+index 0000000..4c490b2
+--- /dev/null
++++ b/pkg/xiaomi/miss/motor.go
+@@ -0,0 +1,43 @@
++package miss
++
++import (
++	"encoding/binary"
++	"fmt"
++
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi/crypto"
++)
++
++// DecodeCommand decrypts a payload that arrived on the command channel (0).
++//
++// Motor responses (cmdMotorRes 0x113) carry a JSON body such as
++// {"angle":..,"elevation":..,"xAngle":..,"yAngle":..}, which lets callers read
++// the current physical position instead of guessing.
++func (c *Client) DecodeCommand(data []byte) []byte {
++	if len(data) <= 8 {
++		return data
++	}
++	if out, err := crypto.Decode(data, c.key); err == nil {
++		return out
++	}
++	return data
++}
++
++// Motor sends a pan/tilt motor command to the camera.
++//
++// operation: 1 - left, 2 - right, 3 - up, 4 - down.
++// This is the same frame the Mi Home app sends (cmdMotorReq 0x112 + JSON body).
++// The camera keeps moving until a stop command arrives, so callers must send
++// Motor(0) — or the model specific stop — after releasing the button.
++func (c *Client) Motor(operation int) error {
++	data := binary.BigEndian.AppendUint32(nil, cmdMotorReq)
++	data = fmt.Appendf(data, `{"operation":%d}`, operation)
++	return c.WriteCommand(data)
++}
++
++// MotorStatus sends the same command with a calibration/status style payload.
++// Some firmwares answer with cmdMotorRes (0x113) carrying the current angles.
++func (c *Client) MotorStatus() error {
++	data := binary.BigEndian.AppendUint32(nil, cmdMotorReq)
++	data = fmt.Appendf(data, `{"operation":0}`)
++	return c.WriteCommand(data)
++}
+diff --git a/pkg/xiaomi/miss/producer.go b/pkg/xiaomi/miss/producer.go
+index dcea284..1cb832f 100644
+--- a/pkg/xiaomi/miss/producer.go
++++ b/pkg/xiaomi/miss/producer.go
+@@ -2,6 +2,7 @@ package miss
+ 
+ import (
+ 	"fmt"
++	"log"
+ 	"net/url"
+ 	"time"
+ 
+@@ -15,16 +16,25 @@ import (
+ type Producer struct {
+ 	core.Connection
+ 	client *Client
++	did    string
+ }
+ 
++// Registry 全局注册表：让云台/对讲能复用取流时已建立的会话。
++var Clients = NewRegistry()
++
+ func Dial(rawURL string) (core.Producer, error) {
+ 	client, err := NewClient(rawURL)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
++	// 必须有专职的命令通道读取协程：摄像头每回一条应答就占一个槽，
++	// channel0 只有 10 个槽，灌满后 cs2 worker 退出、整条连接被关闭。
++	client.StartCommandReader()
++
+ 	u, _ := url.Parse(rawURL)
+ 	query := u.Query()
++	did := query.Get("did")
+ 
+ 	err = client.StartMedia(query.Get("channel"), query.Get("subtype"), query.Get("audio"))
+ 	if err != nil {
+@@ -38,6 +48,14 @@ func Dial(rawURL string) (core.Producer, error) {
+ 		return nil, err
+ 	}
+ 
++	// 登记到全局表：云台/对讲要走同一条会话，不能另开（摄像头上限很低）。
++	// 在 Dial 阶段就登记，而不是 Start()——快照类消费者（frame.jpeg）不会调用
++	// Start()，但那段时间里会话同样是活的，云台命令应该能打进去。
++	if did != "" {
++		Clients.Register(did, client)
++		log.Printf("[miss] registered did=%s clients=%v", did, Clients.Dids())
++	}
++
+ 	return &Producer{
+ 		Connection: core.Connection{
+ 			ID:         core.NewID(),
+@@ -49,6 +67,7 @@ func Dial(rawURL string) (core.Producer, error) {
+ 			Transport:  client,
+ 		},
+ 		client: client,
++		did:    did,
+ 	}, nil
+ }
+ 
+@@ -130,6 +149,11 @@ const timestamp40ms = 48000 * 0.040
+ func (p *Producer) Start() error {
+ 	var audioTS uint32
+ 
++	// 再次确认登记（Dial 时已注册过，这里覆盖重连后的情况）
++	if p.did != "" {
++		Clients.Register(p.did, p.client)
++	}
++
+ 	for {
+ 		_ = p.client.SetDeadline(time.Now().Add(10 * time.Second))
+ 		pkt, err := p.client.ReadPacket()
+@@ -194,6 +218,16 @@ func (p *Producer) Start() error {
+ }
+ 
+ func (p *Producer) Stop() error {
++	if p.did != "" {
++		// 注销必须按 client 身份比对：go2rtc 的 producer 是异步 worker，
++		// 旧 producer 关闭时会晚于新 producer 建立（reconnect 路径），
++		// 如果无条件注销会把刚建立的新会话从表里抹掉。
++		did, client := p.did, p.client
++		go func() {
++			time.Sleep(3 * time.Second)
++			Clients.Unregister(did, client)
++		}()
++	}
+ 	_ = p.client.StopMedia()
+ 	return p.Connection.Stop()
+ }
+diff --git a/pkg/xiaomi/miss/registry.go b/pkg/xiaomi/miss/registry.go
+new file mode 100644
+index 0000000..235200a
+--- /dev/null
++++ b/pkg/xiaomi/miss/registry.go
+@@ -0,0 +1,195 @@
++package miss
++
++import (
++	"fmt"
++	"sync"
++	"time"
++)
++
++// errNoSession 表示这台摄像头当前没有可用的 miss 会话。
++func errNoSession(did string) error {
++	return fmt.Errorf("摄像头 %s 当前没有活跃的取流会话，请先在 HomeEye 里打开这路画面", did)
++}
++
++// Registry 记录所有活跃的 miss 客户端，按 did 索引。
++//
++// 为什么需要它：小米摄像头的 P2P 并发会话上限很低（实测 3 条），而云台
++// (cmdMotorReq) 和对讲 (cmdSpeakerStartReq) 都必须走同一条已建立的 miss
++// 会话——另开一条就会把摄像头的会话表挤满，导致所有客户端互相把对方踢掉
++// （表现是 cs2: EOF）。
++//
++// 所以：go2rtc 自己取流时用的那条会话，同时也能接受云台/对讲命令。
++// 上层（HTTP API）通过这个注册表找到对应客户端，直接在已有连接上下发命令，
++// 不新增任何 P2P 会话。
++type Registry struct {
++	mu      sync.RWMutex
++	clients map[string]*Client
++}
++
++func NewRegistry() *Registry {
++	return &Registry{clients: map[string]*Client{}}
++}
++
++// Register 登记一个客户端。同一 did 重复注册时保留后来的（说明旧连接已失效）。
++func (r *Registry) Register(did string, client *Client) {
++	r.mu.Lock()
++	r.clients[did] = client
++	r.mu.Unlock()
++}
++
++// Unregister 注销（连接关闭时调用）。
++func (r *Registry) Unregister(did string, client *Client) {
++	r.mu.Lock()
++	if c, ok := r.clients[did]; ok && (client == nil || c == client) {
++		delete(r.clients, did)
++	}
++	r.mu.Unlock()
++}
++
++// Get 按 did 取客户端。
++func (r *Registry) Get(did string) *Client {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	return r.clients[did]
++}
++
++// alive 检查客户端的底层连接是否还活着。
++// go2rtc 的 producer 断开后表里可能还留着旧 client（注销有 3 秒延迟），
++// 直接用会往一条死连接上发命令，表现为 broken pipe。
++func (c *Client) alive() bool {
++	if c == nil {
++		return false
++	}
++	// SetDeadline(零值) 会成功返回 nil，说明连接没断；断了会返回错误
++	return c.SetDeadline(time.Time{}) == nil
++}
++
++// Dids 返回当前登记的所有 did。
++func (r *Registry) Dids() []string {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++	out := make([]string, 0, len(r.clients))
++	for did := range r.clients {
++		out = append(out, did)
++	}
++	return out
++}
++
++// Motor 对指定 did 的摄像头下发云台命令。
++// operation: 1 右 / 2 左 / 3 上 / 4 下 / 0 停。
++func (r *Registry) Motor(did string, operation int) error {
++	client := r.live(did)
++	if client == nil {
++		return errNoSession(did)
++	}
++	return client.Motor(operation)
++}
++
++// MotorWait 下发云台命令并等一个回包，返回 (角度, 俯仰, 是否拿到)。
++//
++// 摄像头回的是 cmdMotorRes(0x113)，里面带 {"angle":..,"elevation":..}，
++// 也就是摄像头当前的真实朝向 —— 比我们自己累加角度准得多。
++//
++// 注意：**不要**先调 Motor 再调这个（会发两次命令）。
++// 正确用法是先取 MotorSeq 作为基线，再发命令，最后等回包。
++func (r *Registry) MotorWait(did string, operation int, timeout time.Duration) (int, int, bool) {
++	client := r.live(did)
++	if client == nil {
++		return 0, 0, false
++	}
++
++	prev := client.MotorSeq()
++
++	if err := client.Motor(operation); err != nil {
++		return 0, 0, false
++	}
++
++	return client.WaitMotor(prev, timeout)
++}
++
++// MotorSeq 返回该摄像头已收到的 cmdMotorRes 计数。
++func (r *Registry) MotorSeq(did string) uint64 {
++	client := r.live(did)
++	if client == nil {
++		return 0
++	}
++	return client.MotorSeq()
++}
++
++// WaitMotor 等一个新的云台回包（基线 seq 由调用方在发命令前取）。
++func (r *Registry) WaitMotor(did string, prev uint64, timeout time.Duration) (int, int, bool) {
++	client := r.live(did)
++	if client == nil {
++		return 0, 0, false
++	}
++	return client.WaitMotor(prev, timeout)
++}
++
++// MotorState 返回该摄像头最近一次已知的朝向。
++func (r *Registry) MotorState(did string) (int, int, bool) {
++	client := r.live(did)
++	if client == nil {
++		return 0, 0, false
++	}
++	return client.MotorState()
++}
++
++// LastCommand 返回该摄像头最近一条命令应答（排障用）。
++func (r *Registry) LastCommand(did string) (uint32, string, string) {
++	client := r.live(did)
++	if client == nil {
++		return 0, "", ""
++	}
++	return client.LastCommand()
++}
++
++// live 取出仍然可用的客户端；连接已死的顺手清掉表项。
++func (r *Registry) live(did string) *Client {
++	r.mu.RLock()
++	c := r.clients[did]
++	r.mu.RUnlock()
++	if c == nil {
++		return nil
++	}
++	if !c.alive() {
++		r.Unregister(did, c)
++		return nil
++	}
++	return c
++}
++
++// StartSpeaker 打开对讲（喇叭）通道。
++func (r *Registry) StartSpeaker(did string) error {
++	client := r.live(did)
++	if client == nil {
++		return errNoSession(did)
++	}
++	return client.StartSpeaker()
++}
++
++// StopSpeaker 关闭对讲通道。
++func (r *Registry) StopSpeaker(did string) error {
++	client := r.live(did)
++	if client == nil {
++		return errNoSession(did)
++	}
++	return client.StopSpeaker()
++}
++
++// WriteAudio 写入一帧对讲音频（已按机型编码好的 PCMA / PCM16）。
++func (r *Registry) WriteAudio(did string, codec uint32, payload []byte) error {
++	client := r.live(did)
++	if client == nil {
++		return errNoSession(did)
++	}
++	return client.WriteAudio(codec, payload)
++}
++
++// SpeakerCodec 返回该摄像头的对讲编码格式。
++func (r *Registry) SpeakerCodec(did string) (uint32, string, error) {
++	client := r.live(did)
++	if client == nil {
++		return 0, "", errNoSession(did)
++	}
++	return client.SpeakerCodecID(), client.SpeakerCodecName(), nil
++}
+diff --git a/pkg/xiaomi/miss/speaker.go b/pkg/xiaomi/miss/speaker.go
+new file mode 100644
+index 0000000..f9ac2d1
+--- /dev/null
++++ b/pkg/xiaomi/miss/speaker.go
+@@ -0,0 +1,53 @@
++package miss
++
++import "encoding/binary"
++
++// 摄像头上行语音（对讲）相关。
++//
++// 流程：StartSpeaker() -> 以 40ms 为单位 WriteAudioPCM()/WriteAudio() 反复写 ->
++//       StopSpeaker()。摄像头收到 cmdSpeakerStartReq(0x106) 后回 cmdSpeakerStartRes
++//       (0x107)，回包正常才说明喇叭通道真的开了。
++
++// StopSpeaker 关闭喇叭通道。
++func (c *Client) StopSpeaker() error {
++	data := binary.BigEndian.AppendUint32(nil, cmdSpeakerStop)
++	return c.WriteCommand(data)
++}
++
++// StartMic 显式打开摄像头的麦克风（0x104）。
++//
++// StartMedia(enableaudio=1) 只是让媒体通道带音频轨，实测在 069a01 上拿到的
++// 仍然是 A-law 静音；要真正听到麦克风，还得单独发这条命令。
++func (c *Client) StartMic() error {
++	data := binary.BigEndian.AppendUint32(nil, cmdAudioStart)
++	return c.WriteCommand(data)
++}
++
++// StopMic 关闭摄像头麦克风（0x105）。
++func (c *Client) StopMic() error {
++	data := binary.BigEndian.AppendUint32(nil, cmdAudioStop)
++	return c.WriteCommand(data)
++}
++
++// SpeakerCodecID 返回该型号上行语音要用的 codec。
++// 大部分机型是 PCMA（G.711 A-law，8bit/8kHz）；Dafang/小方是裸 PCM16；
++// chuangmi.camera.72ac1 是 OPUS。
++func (c *Client) SpeakerCodecID() uint32 {
++	if id := c.SpeakerCodec(); id != 0 {
++		return id
++	}
++	return codecPCMA
++}
++
++// SpeakerCodecName 给日志和前端看的可读名字。
++func (c *Client) SpeakerCodecName() string {
++	switch c.SpeakerCodecID() {
++	case codecPCM:
++		return "PCM16/8k"
++	case codecOPUS:
++		return "OPUS/48k"
++	case codecPCMA:
++		return "PCMA/8k"
++	}
++	return "unknown"
++}
