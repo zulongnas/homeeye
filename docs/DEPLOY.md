@@ -202,6 +202,13 @@ cd docker && docker compose pull && docker compose up -d   # 换新镜像，data
 | 服务端源码 | 13 个 `app/server/*.py` 逐个 `py_compile` | 全部通过（Python 3.12） |
 | fpk 出包 | 官方 `fnpack build -d .` | 成功；manifest 末尾自动注入 `checksum = md5(app.tgz)` |
 | 脚本执行位 | 对比旧版包安装后的 `/var/apps/homeeye/cmd/` | 包里 tar 成员是 `0666`，装完是 `0755 root:root` —— 执行位由安装端补，细节见 `docs/DEPLOY-FNOS.md` |
+| GHCR 匿名可拉 | 同一台 NAS 上先 `docker logout ghcr.io`，再 `docker pull ghcr.io/zulongnas/homeeye@sha256:2e0961…` | 无需任何凭据；含下载 3 分 36 秒（境外源，慢但通） |
+| GHCR 镜像能跑 | 用拉下来的镜像起临时容器（`-p 127.0.0.1:18077:8088`，`/tmp` 数据卷） | 8 秒 `healthy`；`/api/health` → `{"ok":true,"version":"1.1.3"}`；未认领时 `/api/state` → 401 |
+| GHCR 云台版 go2rtc | Actions 日志里脚本第 5 步的冒烟输出 | `/api/xiaomi/ptz` 有返回、`/api/xiaomi/motor` 不是 404 —— 补丁确实在镜像里 |
+
+镜像由仓库的 `.github/workflows/ghcr.yml` 手动触发构建（`permissions: packages: write`，
+用仓库自带 `GITHUB_TOKEN`，不需要任何个人令牌）。本体按 HomeEye 版本打 tag，
+云台版 go2rtc 按上游版本打 tag（`1.9.15`）。
 
 ### 没验证的（别照着这些吹）
 
