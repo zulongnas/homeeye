@@ -66,7 +66,17 @@ POST /api/xiaomi/audio?did=<did>              body = PCM16 LE 8kHz 单声道
 GET  /api/xiaomi/ptz                          会话状态 / 角度 / 对讲统计
 ```
 
-`motor` 的返回带 `angle` / `elevation`（摄像头回传的真实朝向）。
+`motor` 的返回带 `angle` / `elevation`（摄像头回传的真实朝向，取最近一次回包的缓存值）。
+
+两处 2026-10-30 的行为修正（对外约定没变）：
+
+* **左右方向**。miss 协议原生操作码是 `1 左 / 2 右`，和这里对外的 `1 右 / 2 左`
+  正好相反。以前把 op 直接透传下去，实测「点右镜头往左转」——用抓帧互相关
+  可以对上：原生 op=1 时画面内容右移（镜头左转），op=2 时内容左移。现在统一在
+  `internal/xiaomi/ptz.go` 的 `motorWireOp` 翻译，`cmd/heptz` 侧车同步。
+* **不再等回包**。`/api/xiaomi/motor` 以前等一个 `cmdMotorRes` 最多 1.2 秒；摄像头
+  对「停」从不回应，按住方向盘时前端每 0.3 秒发一条，请求会排队成「点了半天没
+  反应」。现在发完就返回，朝向用缓存值。
 
 ## 两个容易踩坑的协议细节
 

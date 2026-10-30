@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import nw_api  # noqa: E402
 import nw_config as C  # noqa: E402
+import nw_env  # noqa: E402
 
 _httpd = None
 
@@ -54,6 +55,12 @@ def main():
         sys.stderr.write("[homeeye] v%s listening on http://%s:%d\n" % (nw_api.VERSION, host, port))
     sys.stderr.write("[homeeye] dest=%s var=%s rec=%s\n"
                      % (C.APPDEST, C.PKGVAR, C.recordings_root()))
+    # 运行环境自检：ffmpeg / Python / 小米 SDK 依赖。出问题时这几行就是第一现场，
+    # 诊断本身绝不能把服务拖死，所以单独兜住。
+    try:
+        nw_env.startup_log(sys.stderr.write)
+    except Exception as e:
+        sys.stderr.write("[env] 自检失败：%s\n" % e)
     sys.stderr.flush()
 
     # 云台侧车（heptz）：小米云台/对讲走 miss 私有命令，官方 SDK 不开放，

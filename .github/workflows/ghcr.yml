@@ -21,9 +21,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 镜像版本标签（与 Release 一致，如 1.1.3）
+        description: 镜像版本标签（与 Release 一致，如 1.1.4）
         required: true
-        default: "1.1.3"
+        default: "1.1.4"
       go2rtc_version:
         description: go2rtc 上游版本（要带 v）
         required: true

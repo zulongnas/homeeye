@@ -313,8 +313,11 @@
   }
 
   // ---- 云台（PTZ）--------------------------------------------------------
-  // 后端每次只驱动一小段（hold），前端按住时不断续期；即使浏览器掉线，最坏
-  // 也只多转 0.35 秒就自己停 —— 云台一直转到底是不能接受的失败模式。
+  // 摄像头的一条云台命令只转一小段（实测约 10°）就自己停，所以按住时必须
+  // 连着发。每条命令带 0.9 秒租约：后端到点还没收到新的就补一条停止，
+  // 浏览器掉线也不会让云台一直转到底。
+  var PTZ_HOLD = 0.9;   // 单条命令的租约（秒）
+  var PTZ_TICK = 300;   // 按住时的重发间隔（毫秒）
   function ptzSend(camId, op, hold) {
     return api("api/ptz/move", {
       method: "POST",
@@ -381,14 +384,14 @@
       if (cur === op) return;
       stop();
       cur = op;
-      ptzMove(cam.id, op, 0.35).catch(function (e) {
+      ptzMove(cam.id, op, PTZ_HOLD).catch(function (e) {
         stop();
         toast(e.message, "err");
       });
       timer = setInterval(function () {
         if (!cur) return;
-        ptzMove(cam.id, cur, 0.35).catch(function () {});
-      }, 260);
+        ptzMove(cam.id, cur, PTZ_HOLD).catch(function () {});
+      }, PTZ_TICK);
     }
 
     [["3", "▲", "上"], ["2", "◀", "左"], ["0", "●", "停止"],
@@ -696,6 +699,9 @@
         var old = tile.querySelector(".ptz-pad");
         if (old) { old.parentNode.removeChild(old); return; }
         tile.appendChild(makePtzPad(cam));
+        // 先把 P2P 会话建起来（按需建要 1~3 秒），免得第一下按下去卡在
+        // "正在建立连接"上。op=0 只是空命令，摄像头不会动。
+        ptzSend(cam.id, 0).catch(function () {});
       });
       tile.appendChild(ptzBtn);
 
@@ -2320,6 +2326,35 @@
       box.appendChild(row);
     });
     if (!ids.length) box.textContent = "还没有摄像头。";
+    // 运行环境自检（后端只在登录态返回）：装完出问题时，用户能直接看到
+    // 是缺 ffmpeg、Python 太旧，还是小米 SDK 的 Python 依赖没装
+    var evn = h.env;
+    if (evn) {
+      var ff = evn.ffmpeg || {};
+      var xi = evn.xiaomi || {};
+      var envRow = el("div", "health-row state-idle");
+      envRow.appendChild(el("span", "h-name", "运行环境"));
+      envRow.appendChild(el("span", "badge state-idle", "自检"));
+      envRow.appendChild(el("span", "h-detail",
+        "ffmpeg " + (ff.ok ? (ff.version || "已找到") : "缺失") +
+        " · Python " + (evn.python || "?") +
+        " · 小米 SDK " + (xi.ok ? "就绪" : "不可用")));
+      box.appendChild(envRow);
+      (evn.warnings || []).forEach(function (w) {
+        var wr = el("div", "health-row state-broken");
+        wr.appendChild(el("span", "h-name", "缺少依赖"));
+        wr.appendChild(el("span", "badge state-broken", "注意"));
+        wr.appendChild(el("span", "h-detail", w));
+        box.appendChild(wr);
+      });
+      (evn.notes || []).forEach(function (n) {
+        var nr = el("div", "health-row state-idle");
+        nr.appendChild(el("span", "h-name", "说明"));
+        nr.appendChild(el("span", "badge state-idle", "可选"));
+        nr.appendChild(el("span", "h-detail", n));
+        box.appendChild(nr);
+      });
+    }
     var st = h.status || "ok";
     sum.textContent = "总体：" + (st === "ok" ? "链路正常"
       : st === "degraded" ? "有设备离线（不告警，等它自己回来）"

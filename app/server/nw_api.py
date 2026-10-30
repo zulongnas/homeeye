@@ -26,12 +26,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import nw_auth as A
 import nw_config as C
+import nw_env as E
 import nw_health as H
 import nw_live as L
 import nw_record as R
 import nw_watchdog as W
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 BOUNDARY = "nwframe"
 
 _live = None
@@ -517,6 +518,12 @@ class Handler(BaseHTTPRequestHandler):
                 # 登录态才带看门狗：自愈流水里有摄像头名与设备地址
                 s = dict(s)
                 s["watchdog"] = W.brief()
+                # 运行环境自检（ffmpeg / Python / 小米 SDK 依赖）也只在登录态给：
+                # 里面有宿主机路径，不该出现在无凭据的 healthcheck 响应里
+                try:
+                    s["env"] = E.report()
+                except Exception as e:
+                    s["env"] = {"warnings": ["自检失败：%s" % e]}
             # 只有 broken 才让状态码变红：主卧每晚断电不该把容器拖着重启
             return self._send(200 if s.get("healthy") else 503,
                               _json_bytes({"ok": True, "version": VERSION,

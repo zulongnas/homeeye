@@ -1,9 +1,299 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..fa1385d
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1 @@
++* -text
+diff --git a/PATCHES.md b/PATCHES.md
+new file mode 100644
+index 0000000..db2c056
+--- /dev/null
++++ b/PATCHES.md
+@@ -0,0 +1,138 @@
++# go2rtc 小米摄像头补丁（云台 / 对讲）
++
++上游：https://github.com/AlexxIT/go2rtc （本目录是在 `master-hardware` 对应源码上打的补丁）
++基线版本：`1.9.15+dev`
++
++HomeEye 的云台/对讲功能**依赖**这个补丁版 go2rtc。现网已切到本补丁构建的镜像
++`homeeye/go2rtc:1.0.6-ptz`（源码基线 = git tag `v1.9.15-ptz.1`，见 `UPSTREAM.md`）；
++官方原版 `alexxit/go2rtc:master-hardware` 只是它的基础层，没有下面这些接口。
++
++---
++
++## 为什么必须打补丁（三个硬约束）
++
++### 1. 小米摄像头的 P2P 并发会话上限只有 3 条
++
++云台（`cmdMotorReq 0x112`）和对讲（`cmdSpeakerStartReq 0x106`）的命令
++**必须**跑在一条已经建立的 miss 会话上，另开一条会把摄像头的会话表挤满，
++表现是所有人互相把对方踢掉（`cs2: EOF`）。
++
++所以补丁让 go2rtc 把**自己取流用的那条会话**注册进一张全局表，
++再暴露 HTTP 接口，直接在那条会话上下发命令 —— 摄像头那边一条会话都没多。
++
++### 2. channel0（命令应答通道）必须有人读
++
++摄像头对每条命令都会回一个应答，而 channel0 的接收缓冲区只有 **10 个槽**。
++没人读的话灌满后 `cs2.dataChannel.Push` 返回 `pop buffer is full`，
++worker 直接退出 —— **整条 P2P 连接被关闭**，之后所有命令都报 broken pipe。
++
++原版 go2rtc 从来不读 channel0（只有媒体通道 channel2 被消费）。
++补丁加了一个专职的命令读取协程（`pkg/xiaomi/miss/cmdreader.go`）。
++
++实测：修复前连发第 10 条命令后连接必断；修复后连发 15 条依然正常。
++
++### 3. channel3（上行音频通道）以前根本没发出去数据
++
++`cs2/conn.go` 的 `WritePacket` 写错了：
++
++```go
++copy(req[offset+hdrSize:], hdr)   // ❌ 写的是头
++```
++
++payload 从来没被发出去，结果是 channel3 上全是空包 —— **对讲永远没有声音**。
++改成 `copy(req[offset+hdrSize:], payload)` 之后才真正出声。
++
++---
++
++## 改动清单
++
++| 文件 | 改动 |
++|---|---|
++| `pkg/xiaomi/miss/cs2/conn.go` | ① `WritePacket` 修正 payload 拷贝（channel3 上行音频）<br>② 新增 `ReadCommandRaw()`：返回未经拆分的原始命令缓冲区<br>③ `pktMu` 互斥锁：HTTP handler 并发写 channel3 要串行化 |
++| `pkg/xiaomi/miss/cmdreader.go` | **新增**。命令通道读取协程 + 云台角度缓存（见下） |
++| `pkg/xiaomi/miss/client.go` | Client 加 `cr *cmdReader` 字段 |
++| `pkg/xiaomi/miss/producer.go` | `Dial()` 里调用 `StartCommandReader()`（**不在** `NewClient` 里，因为 `cmd/heptz` 侧车自带读取协程，两个协程抢同一条 channel0 会把回包分走） |
++| `pkg/xiaomi/miss/registry.go` | 全局注册表 `Clients`：`Motor` / `MotorWait` / `MotorSeq` / `WaitMotor` / `MotorState` / `LastCommand` / `StartSpeaker` / `StopSpeaker` / `WriteAudio` / `SpeakerCodec` |
++| `internal/xiaomi/ptz.go` | **新增**。4 个 HTTP 接口 + A-law 转换（见下） |
++| `internal/xiaomi/xiaomi.go` | 注册 4 个路由：`/api/xiaomi/motor`、`/api/xiaomi/speaker`、`/api/xiaomi/audio`、`/api/xiaomi/ptz` |
++
++## 新增的 HTTP 接口
++
++```
++GET  /api/xiaomi/motor?did=<did>&op=<0-15>   云台：0停 1右 2左 3上 4下（+5/6/10/11 快速档）
++POST /api/xiaomi/speaker?did=<did>            打开喇叭通道（对讲）
++POST /api/xiaomi/speaker?did=<did>&stop=1     关闭喇叭通道
++POST /api/xiaomi/audio?did=<did>              body = PCM16 LE 8kHz 单声道
++GET  /api/xiaomi/ptz                          会话状态 / 角度 / 对讲统计
++```
++
++`motor` 的返回带 `angle` / `elevation`（摄像头回传的真实朝向，取最近一次回包的缓存值）。
++
++两处 2026-10-30 的行为修正（对外约定没变）：
++
++* **左右方向**。miss 协议原生操作码是 `1 左 / 2 右`，和这里对外的 `1 右 / 2 左`
++  正好相反。以前把 op 直接透传下去，实测「点右镜头往左转」——用抓帧互相关
++  可以对上：原生 op=1 时画面内容右移（镜头左转），op=2 时内容左移。现在统一在
++  `internal/xiaomi/ptz.go` 的 `motorWireOp` 翻译，`cmd/heptz` 侧车同步。
++* **不再等回包**。`/api/xiaomi/motor` 以前等一个 `cmdMotorRes` 最多 1.2 秒；摄像头
++  对「停」从不回应，按住方向盘时前端每 0.3 秒发一条，请求会排队成「点了半天没
++  反应」。现在发完就返回，朝向用缓存值。
++
++## 两个容易踩坑的协议细节
++
++### a) 应答帧的布局
++
++channel0 弹出的缓冲区是 `[4 字节外层 cmd(大端)][加密的 body]`，
++外层 cmd 一般是 `0x1001`（cmdEncoded，表示 body 是加密的）。
++
++**解密后的 body 前面 4 个字节才是真正的命令号（大端）**，后面才是负载：
++
++```
++解密后：00 00 01 13 + {"ret":0, "angle":88,"elevation":100}
++          ^^^^^^^^ cmdMotorRes(0x113)
++```
++
++所以 `cmdreader.go` 是先解密、再从前 4 字节取命令号。
++一开始按固定偏移猜命令号，拿到的是 `0x1001`，角度一直取不到。
++
++### b) 对讲音频的编码
++
++摄像头要的是 **G.711 A-law（8bit/8kHz）**，而浏览器给的是 **PCM16**。
++原版接口假设「调用方送来的已经是摄像头原生格式」，结果 PCM16 被当 A-law 切帧，
++摄像头收到的是乱码（声音又尖又快）。
++
++现在 `/api/xiaomi/audio` 的约定改成：**body 永远是 PCM16 LE 8kHz 单声道**，
++由 go2rtc 按机型转换：
++- codec 1027 (PCMA) → 转 A-law，一帧 40ms = 320 字节
++- codec 1024 (PCM16) → 原样，一帧 40ms = 640 字节
++- codec 1032 (OPUS) → 暂不支持
++
++## 编译与出镜像
++
++一条命令从本仓库源码到镜像（NAS 上跑，只需要 docker）：
++
++```sh
++sh homeeye-build-image.sh
++```
++
++它做四件事：容器内静态编译（`golang:1.26-alpine`，宿主机不用装 Go）→ 以
++`alexxit/go2rtc:master-hardware` 为基座替换 `/usr/local/bin/go2rtc` → 打 tag →
++**在独立端口起一个临时容器做冒烟回归**（`/api/xiaomi/ptz` 必须在、`motor` 不能 404），
++任一不过就 exit 1。手工版等价命令：
++
++```sh
++docker run --rm -v "$SRC":/src -v /tmp/gocache:/go -w /src \
++  -e GOPROXY=https://goproxy.cn,direct -e CGO_ENABLED=0 -e GOFLAGS=-mod=mod \
++  golang:1.26-alpine go build -trimpath -ldflags="-s -w" -o /out/go2rtc ./
++```
++
++## 部署
++
++现网走的是**镜像**，不是 bind mount 二进制：改 compose 的 `image:` 再
++`docker compose up -d --force-recreate go2rtc`。
++
++早先用过的 `nvr/he_build_g2r.sh`（停容器 → 覆盖 `/tmp/g2build` 里的二进制 → 起容器）
++只适合临时试验：二进制是挂进去的，运行中覆盖会 `Text file busy`，而且镜像内容与实际
++跑的字节会不一致，出事查不到是哪份代码。要以镜像为准。
++
++升级与回归的完整流程见 `UPSTREAM.md`。
+diff --git a/UPSTREAM.md b/UPSTREAM.md
+new file mode 100644
+index 0000000..10aba92
+--- /dev/null
++++ b/UPSTREAM.md
+@@ -0,0 +1,133 @@
++# 上游升级与回归手册（go2rtc 小米补丁版）
++
++本仓库是 [AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc) 的**补丁分叉**，不是 fork
++出来的独立项目：只在小米 miss 协议那几处动了刀，其余与上游逐字节一致。
++
++| 引用 | 含义 |
++|---|---|
++| `upstream-v1.9.15` | 上游 tag `v1.9.15` 的源码（去掉 `website/`，那是文档站，编译不需要） |
++| `v1.9.15-ptz.1` | 打满 HomeEye 补丁的当前版本，**生产镜像 `homeeye/go2rtc:1.0.6-ptz` 的源码基线** |
++| `PATCHES.md` | 补丁内容、为什么必须打、踩过的协议坑 |
++| `homeeye-build-image.sh` | 从本仓库源码一路做到镜像，并自带冒烟回归 |
++
++看补丁到底改了什么，用这条：
++
++```sh
++git diff --stat upstream-v1.9.15..v1.9.15-ptz.1
++```
++
++应当恰好是 13 个文件（`pkg/xiaomi/miss/*`、`internal/xiaomi/*`、`cmd/heptz/*`、
++`PATCHES.md`、`.gitattributes`）。多出来的就是上游漂移或误改。
++
++---
++
++## 一、什么时候需要升级
++
++只有两种情况：
++
++1. 上游修了我们也在受影响的 bug（尤其 `pkg/xiaomi/` 与 `pkg/webrtc/`）；
++2. 我们要上游的新功能（新的容器格式、新的硬件转码支持）。
++
++**不建议为了"跟新"而跟。** 这套补丁的价值全在 P2P 会话与 channel0 读取那条链路上，
++上游每次重构 `miss` 包都可能把我们的假设打断（例如 `Dial()` 的返回值、
++`dataChannel.Push` 的缓冲槽数）。没有明确收益就别动现网。
++
++## 二、升级步骤
++
++```sh
++# 1. 拉上游新源码（直连 git 在境内不稳，用 codeload 的 tarball）
++VER=v1.9.16
++curl -sL -o /tmp/up.tgz https://codeload.github.com/AlexxIT/go2rtc/tar.gz/refs/tags/$VER
++sha256sum /tmp/up.tgz            # 记进 commit message，可追溯
++mkdir -p /tmp/up && tar xzf /tmp/up.tgz -C /tmp/up && cd /tmp/up/go2rtc-*/
++rm -rf website
++
++# 2. 新建基线分支与提交
++cd <本仓库>
++git checkout -b upgrade-$VER upstream-v1.9.15
++find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
++cp -a /tmp/up/go2rtc-$VER/. .
++git add -A && git commit -m "upstream: go2rtc $VER（tarball sha256=...）"
++git tag upstream-$VER
++
++# 3. 把补丁重放到新基线
++git checkout -b ptz-$VER
++git cherry-pick v1.9.15-ptz.1      # 只有那一个补丁 commit，冲突集中且明确
++```
++
++### cherry-pick 冲突的判读顺序
++
++按这个顺序处理，别一把梭 `--theirs`：
++
++| 文件 | 冲突意味着 | 处理 |
++|---|---|---|
++| `pkg/xiaomi/miss/cs2/conn.go` | 上游改了 P2P 包封装。**必须逐行看**，`WritePacket` 的 payload 拷贝是我们的核心修复 | 保留上游结构，把 `copy(req[offset+hdrSize:], payload)`、`ReadCommandRaw()`、`pktMu` 三处重新贴上去 |
++| `pkg/xiaomi/miss/producer.go` | `Dial()` 流程变了 | 只要会话建立成功点还在，就在同一点重新调用 `StartCommandReader()` |
++| `pkg/xiaomi/miss/client.go` | Client 字段/生命周期变了 | 重新挂 `cr *cmdReader`，注意 close 时要停掉读取协程 |
++| `internal/xiaomi/xiaomi.go` | 路由注册方式变了 | 重新注册那 4 个 `/api/xiaomi/*` |
++| `cmd/heptz/*`、`pkg/xiaomi/miss/{cmdreader,registry,motor,speaker}.go`、`internal/xiaomi/ptz.go` | 全是新增文件，正常不冲突 | 直接保留 |
++
++如果上游把 `miss` 包整体重命名或重写，**停下来先读上游 diff**，别硬贴补丁。
++
++## 三、升级后必须跑的回归（顺序不能换）
++
++### 1. 编译 + 冒烟（不需要真实摄像头，脚本自带）
++
++```sh
++sh homeeye-build-image.sh            # TAG=homeeye/go2rtc:1.0.7-ptz 换新版标签
++```
++
++脚本第 4 步会拿独立端口起一个临时容器，检查 `/api/xiaomi/ptz` 存在、
++`/api/xiaomi/motor` 不是 404、`/api/streams` 有响应。任一条不过就 exit 1。
++**这一步同时防住"补丁没进去"和"冒烟容器撞了现网 1984"两件事。**
++
++### 2. 会话与通道（要真实摄像头，客厅那台常插电，用它在 NAS 上测）
++
++- **取流**：`GET /api/streams` 里这一路 `source` 能起来，`/api/stream.mp4?src=...` 出画面；
++- **云台角度回传**：`GET /api/xiaomi/motor?did=<did>&op=1` 后 `GET /api/xiaomi/ptz`
++  里 `angle`/`elevation` 要变。**取不到角度 = channel0 没人读或解密后命令号偏移错了**
++  （见 PATCHES.md「应答帧的布局」）；
++- **不断连**：连发 **15 条** motor 命令（>10 个槽），中途不能出现 `pop buffer is full`
++  或 broken pipe。原版就是在这里断的，这条是补丁的立身之本；
++- **对讲有声**：`POST /api/xiaomi/speaker?did=<did>` 开喇叭，`POST /api/xiaomi/audio`
++  送 **PCM16 LE 8kHz 单声道**，摄像头要播人声。又尖又快 = 当成 A-law 切帧的编码问题；
++- **会话名额**：一台摄像头同时最多 3 条 P2P 会话。HomeEye 的看门狗巡检间隔下限因此
++  锁在 15 秒。测云台/对讲时不要另开 `cmd/heptz` 侧车，两个读取协程会抢同一条 channel0。
++
++### 3. 与 HomeEye 的联动（1.1.1 起）
++
++- `PUT /api/streams?name=&src=` 纠源可用且写后复核 —— HomeEye 的 **IP 漂移自愈**靠它。
++  手动把某条流的地址改成错的，再在 HomeEye 设置页点「手动修复全部异常」，
++  应当看到流地址被改回且其它流没被动；
++- `api.listen: 127.0.0.1:1984` + `api.username/password` 生效，HomeEye 带
++  `ptz.g2r_user/g2r_pass` 能调通，不带凭据要 401；
++- HomeEye 设置页「链路健康」没有把这两路判成 `broken`，`/api/health` 返回 200。
++
++## 四、发布与回滚
++
++```sh
++# 发布：改 compose 的 image 再重建容器（二进制在镜像里，不能运行中覆盖）
++docker compose up -d --force-recreate go2rtc
++# 回滚：image 改回上一个 tag，同一条命令再来一次
++```
++
++镜像标签与 git tag 一一对应，命名 `v<上游>-ptz.<序号>`，镜像 `homeeye/go2rtc:<序号对应>-ptz`。
++现网对应关系：
++
++| 镜像 | 源码 tag |
++|---|---|
++| `homeeye/go2rtc:1.0.6-ptz` | `v1.9.15-ptz.1` |
++
++复现性已验证（NAS，2026-10-29）：`STRIP=0 sh homeeye-build-image.sh` 从本仓库工作树编出的
++二进制 sha256 = `d7cc80059062fd6fdba7a1a8d744df58968e8895de4e27384ed2225e3bc547a8`，
++与现网镜像里 `/usr/local/bin/go2rtc` 完全一致，叠层出的镜像 ID 也与现网
++`b67dd5cf9949` 相同 —— 也就是说现网跑的那份，确实就是这份源码。
++以后升级重打时，只要拿这两个值当基线比对，就不会出现"镜像和源码不是一回事"。
++
++## 五、别做的事
++
++- 不要 `git push` 到上游，也不要给上游提 PR —— 我们改的 `channel0` 读取与
++  `WritePacket` 是小米私有协议的行为修正，上游没有对应测试，合并风险由我们承担；
++- 不要把 `website/` 捡回来，也不要提交编译产物（`go2rtc-new`、`/tmp/g2img` 那些）；
++- 不要在运行中的容器里覆盖 `/usr/local/bin/go2rtc`（`Text file busy`，而且会让
++  镜像与实际跑的字节不一致 —— 出问题查不到是哪份代码）。
 diff --git a/cmd/heptz/main.go b/cmd/heptz/main.go
 new file mode 100644
-index 0000000..b840c70
+index 0000000..a0d43d5
 --- /dev/null
 +++ b/cmd/heptz/main.go
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,733 @@
 +// HomeEye PTZ sidecar.
 +//
 +// Holds one Mi Home "miss" P2P session per camera and exposes a tiny HTTP API so
@@ -506,13 +796,24 @@ index 0000000..b840c70
 +
 +// ---- HTTP ----
 +
++// motorWireOp 把对外约定（1 右 / 2 左）翻成 miss 协议的原生操作码（1 左 / 2 右）。
++func motorWireOp(op int) int {
++	switch op {
++	case 1:
++		return 2
++	case 2:
++		return 1
++	}
++	return op
++}
++
 +func apiPTZ(w http.ResponseWriter, r *http.Request) {
 +	q := r.URL.Query()
 +	name := q.Get("cam")
 +	opStr := q.Get("op")
 +	op, err := strconv.Atoi(opStr)
 +	if err != nil || op < 0 || op > 15 {
-+		http.Error(w, "bad op (0 stop,1 left,2 right,3 up,4 down)", http.StatusBadRequest)
++		http.Error(w, "bad op (0 stop,1 right,2 left,3 up,4 down)", http.StatusBadRequest)
 +		return
 +	}
 +
@@ -522,7 +823,7 @@ index 0000000..b840c70
 +		return
 +	}
 +
-+	if err = s.client.Motor(op); err != nil {
++	if err = s.client.Motor(motorWireOp(op)); err != nil {
 +		// 连接可能已死，标记一下，下次调用重连
 +		mu.Lock()
 +		sessions[name] = &session{cfg: s.cfg, err: err}
@@ -1033,12 +1334,115 @@ index 0000000..01d7922
 +		}
 +	}
 +}
+diff --git a/homeeye-build-image.sh b/homeeye-build-image.sh
+new file mode 100644
+index 0000000..1d78562
+--- /dev/null
++++ b/homeeye-build-image.sh
+@@ -0,0 +1,97 @@
++#!/bin/sh
++# 从本仓库源码构建 HomeEye 定制版 go2rtc 镜像 —— 一条命令从 git 到镜像。
++#
++#   sh homeeye-build-image.sh                              # 打当前工作树
++#   GIT_REF=v1.9.15-ptz.1 sh homeeye-build-image.sh        # 先切到某个 tag 再打
++#   TAG=homeeye/go2rtc:1.0.7-ptz sh homeeye-build-image.sh # 升版本时换标签
++#
++# 为什么镜像要自己构建：生产用的是 alexxit/go2rtc:master-hardware 打底、
++# 只替换 /usr/local/bin/go2rtc 本体。官方 master-hardware 那层的 ffmpeg 与
++# 核显驱动是硬件转码要的，我们的补丁只改 Go 源码，所以叠加是等价且最小的做法。
++#
++# 注意：千万不要把二进制直接 bind mount 进运行中的容器再覆盖 —— 会 "Text file busy"。
++# 要走镜像：build 完改 compose 的 image，再 docker compose up -d --force-recreate。
++set -e
++
++TAG="${TAG:-homeeye/go2rtc:1.0.6-ptz}"
++BASE="${BASE:-alexxit/go2rtc:master-hardware}"
++GOIMG="${GOIMG:-golang:1.26-alpine}"
++REPO="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
++SRC="${SRC:-$REPO}"
++WORK=/tmp/he-g2r-image
++SMOKE_PORT="${SMOKE_PORT:-19850}"
++SMOKE_IN=1985
++
++echo "== 0. 取源码 =="
++if [ -n "$GIT_REF" ]; then
++  git -C "$SRC" checkout "$GIT_REF" || { echo "checkout $GIT_REF 失败"; exit 1; }
++fi
++git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo "   （非 git 工作树，直接编 $SRC）"
++
++echo "== 1. 基础镜像 =="
++docker image inspect "$BASE" >/dev/null 2>&1 || docker pull "$BASE"
++echo "   $BASE 就绪"
++
++echo "== 2. 编译静态二进制（容器里编，宿主机不需要 Go 工具链） =="
++rm -rf "$WORK"
++mkdir -p "$WORK/out" "$WORK/ctx/config"
++# STRIP=0 编出来的二进制与"手工 go build ./"等价，用来验证本仓库能逐字节复现现网
++# 镜像里那份（sha256 对得上才算 fork 真的进了版本控制）；日常出镜像用默认 STRIP=1，小一半。
++# 用 set -- 传参：-ldflags 的值里有空格，走普通变量会在 word 拆分时被切开。
++if [ "${STRIP:-1}" = "1" ]; then
++  set -- -trimpath -ldflags "-s -w"
++else
++  set --
++fi
++docker run --rm \
++  -v "$SRC":/src:ro \
++  -v "$WORK/out":/out \
++  -v /tmp/gocache:/go \
++  -w /src \
++  -e GOPROXY=https://goproxy.cn,direct \
++  -e CGO_ENABLED=0 \
++  -e GOFLAGS=-mod=mod \
++  "$GOIMG" go build "$@" -o /out/go2rtc ./
++ls -l "$WORK/out/go2rtc"
++sha256sum "$WORK/out/go2rtc"
++"$WORK/out/go2rtc" --version 2>/dev/null | head -2 || file "$WORK/out/go2rtc"
++
++echo "== 3. 构建 $TAG =="
++cp "$WORK/out/go2rtc" "$WORK/ctx/go2rtc"
++chmod 755 "$WORK/ctx/go2rtc"
++cat > "$WORK/ctx/Dockerfile" <<EOF
++FROM $BASE
++COPY go2rtc /usr/local/bin/go2rtc
++RUN chmod 755 /usr/local/bin/go2rtc
++EOF
++docker build -q -t "$TAG" "$WORK/ctx"
++docker image inspect "$TAG" --format 'built: {{.Id}} size={{.Size}}'
++
++echo "== 4. 冒烟回归：补丁接口必须在，且不能撞到现网 go2rtc =="
++# 单独一个 bridge 网络容器 + 自己的端口映射，绝不碰 127.0.0.1:1984 那个在跑的。
++cat > "$WORK/ctx/config/go2rtc.yaml" <<EOF
++api:
++  listen: ":$SMOKE_IN"
++EOF
++docker rm -f he-g2r-smoke >/dev/null 2>&1 || true
++docker run -d --name he-g2r-smoke \
++  -v "$WORK/ctx/config":/config \
++  -p 127.0.0.1:$SMOKE_PORT:$SMOKE_IN \
++  "$TAG" >/dev/null
++sleep 4
++PTZ=$(curl -s --max-time 8 "http://127.0.0.1:$SMOKE_PORT/api/xiaomi/ptz" || echo "")
++code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://127.0.0.1:$SMOKE_PORT/api/xiaomi/motor?did=0&op=0" || echo 000)
++STREAMS=$(curl -s --max-time 8 "http://127.0.0.1:$SMOKE_PORT/api/streams" | head -c 120)
++docker rm -f he-g2r-smoke >/dev/null 2>&1 || true
++
++echo "   /api/xiaomi/ptz   : $PTZ"
++echo "   /api/xiaomi/motor : HTTP $code"
++echo "   /api/streams      : $STREAMS"
++
++case "$PTZ" in
++  *"not found"*|*"404"*|"") echo "FAIL: /api/xiaomi/ptz 不在 —— 这个镜像没带上云台补丁"; exit 1 ;;
++esac
++[ "$code" = "404" ] && { echo "FAIL: /api/xiaomi/motor 404，补丁没生效"; exit 1; }
++[ -n "$STREAMS" ] || { echo "FAIL: /api/streams 空，本体没起来"; exit 1; }
++
++echo "OK: $TAG （源码 $SRC）"
 diff --git a/internal/xiaomi/ptz.go b/internal/xiaomi/ptz.go
 new file mode 100644
-index 0000000..84bca7b
+index 0000000..3a6d1a0
 --- /dev/null
 +++ b/internal/xiaomi/ptz.go
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,269 @@
 +package xiaomi
 +
 +import (
@@ -1067,6 +1471,8 @@ index 0000000..84bca7b
 +//   POST /api/xiaomi/speaker?did=1234567890         打开对讲通道
 +//   POST /api/xiaomi/audio?did=1234567890           body = 裸 A-law/PCM16
 +//   POST /api/xiaomi/speaker/stop?did=1234567890    关闭对讲通道
++//
++// 注意 op 的方向和对内下发的操作码是**反的**，见 motorWireOp。
 +
 +// talkBuf 攒音频用：A-law 8k 一帧 40ms = 320 字节。
 +const talkFrameBytes = 320
@@ -1081,6 +1487,21 @@ index 0000000..84bca7b
 +	active bool
 +	frames int
 +	bytes  int
++}
++
++// motorWireOp 把对外的方向约定（1 右 / 2 左）翻成 miss 协议的原生操作码。
++//
++// 原生码是 1 左 / 2 右（见 pkg/xiaomi/miss/motor.go），和对外的约定正好相反。
++// 实测（抓转动前后的画面做互相关）：原生 op=1 时画面内容右移，即镜头向左转。
++// 以前这里直接透传，结果就是"点右往左转"。
++func motorWireOp(op int) int {
++	switch op {
++	case 1:
++		return 2
++	case 2:
++		return 1
++	}
++	return op
 +}
 +
 +// apiXiaomiMotor 云台控制。
@@ -1100,22 +1521,21 @@ index 0000000..84bca7b
 +		return
 +	}
 +
-+	// 先记下当前回包计数，再发命令，最后等一个新的 cmdMotorRes。
-+	// 摄像头回的 0x113 里带 {"angle":..,"elevation":..}，是真实朝向。
-+	seq := miss.Clients.MotorSeq(did)
++	wire := motorWireOp(op)
 +
-+	if err = miss.Clients.Motor(did, op); err != nil {
++	if err = miss.Clients.Motor(did, wire); err != nil {
 +		http.Error(w, err.Error(), http.StatusBadGateway)
 +		return
 +	}
 +
-+	log.Info().Msgf("[xiaomi] motor did=%s op=%d", did, op)
++	log.Info().Msgf("[xiaomi] motor did=%s op=%d wire=%d", did, op, wire)
 +
-+	// 转到位大概要几百毫秒，最多等 1.2 秒。
-+	angle, elev, ok := miss.Clients.WaitMotor(did, seq, 1200*time.Millisecond)
-+
++	// 不等回包。摄像头对「停」从不回 0x113，转向回包也要几百毫秒，而按住
++	// 方向盘时前端每 0.3 秒就发一条 —— 在这里等满 1.2 秒会把请求排成队，
++	// 表现就是"点了半天没反应"。朝向回最近一次回包的值即可（/api/xiaomi/ptz
++	// 里也是这个值）。
 +	out := map[string]any{"ok": true, "did": did, "op": op}
-+	if ok {
++	if angle, elev, ok := miss.Clients.MotorState(did); ok {
 +		out["angle"] = angle
 +		out["elevation"] = elev
 +	}

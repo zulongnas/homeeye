@@ -22,7 +22,7 @@ curl -s http://127.0.0.1:8088/api/health | head -c 300
 
 | 镜像 | 是什么 | 备注 |
 |---|---|---|
-| `ghcr.io/zulongnas/homeeye:1.1.3` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
+| `ghcr.io/zulongnas/homeeye:1.1.4` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
 | `ghcr.io/zulongnas/homeeye-go2rtc-ptz:1.9.15` | go2rtc 官方 `master-hardware` + 云台/对讲补丁 | tag 是 go2rtc 的上游版本（它只在换上游时变）；换回 `alexxit/go2rtc:master-hardware` 也能拉流硬转 |
 
 要改代码、要小米 SDK、或者不想用别人构建的镜像，就用本地构建（镜像名不变，
@@ -181,7 +181,7 @@ cd docker && docker compose pull && docker compose up -d   # 换新镜像，data
 `always/never`（升级不改行为）。回滚 = 换回旧 tag 的镜像再起一次；
 `data/` 不需要动，也没有数据库迁移。新版镜像在
 [Releases](https://github.com/zulongnas/homeeye/releases) 里能找到对应版本号
-（tag 就是镜像 tag，例如 `1.1.3`）。
+（tag 就是镜像 tag，例如 `1.1.4`）。
 
 ## 七、发布包实测记录（2026-10-30）
 

@@ -888,10 +888,68 @@ def release_all_g2r_sessions():
         release_g2r_session(did)
 
 
+# ── 自动停的租约 ──────────────────────────────────────────────────────
+# 按住方向盘时前端会每 0.3 秒续一条命令，松手立刻补一条 op=0。这里给每路
+# 摄像头**只留一条**看护线程：命令到了就延后到期时间，到期没续上再发停止。
+#
+# 以前是「每条命令各起一个 hold 秒后停止的线程」，按住时停止命令和转动命令
+# 交错下发，云台一顿一顿地挪，看着就像没反应 —— 这是必须修掉的那一版。
+_stop_lock = threading.RLock()
+_stop_leases = {}        # did -> {"until": 到期时刻}
+
+
+def _send_motor(did, op, timeout=8):
+    if backend() == "go2rtc":
+        return _g2r_call("/api/xiaomi/motor?did=%s&op=%d" % (did, int(op)),
+                         timeout=timeout)
+    return _request("/ptz?cam=%s&op=%d" % (did, int(op)))
+
+
+def _stop_worker(did):
+    while True:
+        with _stop_lock:
+            st = _stop_leases.get(did)
+            if st is None:
+                return
+            left = st["until"] - time.time()
+        if left > 0:
+            time.sleep(min(left, 0.5))
+            continue
+        with _stop_lock:
+            st = _stop_leases.get(did)
+            if st is None:
+                return
+            if st["until"] > time.time():
+                continue
+            _stop_leases.pop(did, None)
+        try:
+            _send_motor(did, 0)
+        except Exception:
+            pass
+        return
+
+
+def _lease(did, hold):
+    now = time.time()
+    with _stop_lock:
+        st = _stop_leases.get(did)
+        if st is not None:
+            st["until"] = now + float(hold)
+            return
+        _stop_leases[did] = {"until": now + float(hold)}
+    threading.Thread(target=_stop_worker, args=(did,), daemon=True).start()
+
+
+def _lease_cancel(did):
+    with _stop_lock:
+        _stop_leases.pop(did, None)
+
+
 def move(cam_id, op, hold=None):
     """转动云台。op: 0 停 / 1 右 / 2 左 / 3 上 / 4 下。
 
-    `hold` 为按住时长（秒）：给了就由后端负责到时自动停，前端只管发一次。
+    `hold` 为按住时长（秒）：在到期前不断续租，松手（op=0）或浏览器掉线
+    都会让这条命令停下来。
     """
     ok, why = available()
     if not ok:
@@ -914,34 +972,20 @@ def move(cam_id, op, hold=None):
         with _preload_lock:
             if did in _preloaded:
                 _preloaded[did]["at"] = time.time()
-        try:
-            res = _g2r_call("/api/xiaomi/motor?did=%s&op=%d" % (did, int(op)))
-        except Exception as e:
-            if _is_no_session(e):
-                raise PtzError(
-                    "尚未建立取流会话，请稍后重试",
-                    need_session=True)
-            raise PtzError(str(e))
-        _stop_at = None
-    else:
-        ensure_running()
-        try:
-            res = _request("/ptz?cam=%s&op=%d" % (did, int(op)))
-        except Exception as e:
-            raise PtzError(str(e))
-        _stop_at = did
 
-    if hold and op:
-        def _stop():
-            time.sleep(float(hold))
-            try:
-                if backend() == "go2rtc":
-                    _g2r_call("/api/xiaomi/motor?did=%s&op=0" % did, timeout=8)
-                else:
-                    _request("/ptz?cam=%s&op=0" % _stop_at)
-            except Exception:
-                pass
-        threading.Thread(target=_stop, daemon=True).start()
+    try:
+        if backend() != "go2rtc":
+            ensure_running()
+        res = _send_motor(did, op)
+    except Exception as e:
+        if _is_no_session(e):
+            raise PtzError("尚未建立取流会话，请稍后重试", need_session=True)
+        raise PtzError(str(e))
+
+    if not op:
+        _lease_cancel(did)
+    elif hold:
+        _lease(did, hold)
     return res
 
 

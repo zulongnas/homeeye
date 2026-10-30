@@ -11,7 +11,7 @@ go2rtc 是 MIT 许可（`LICENSE`，Copyright (c) 2022 Alexey Khit）。本目�
 **补丁文件**与说明，不复制上游源码：
 
 ```sh
-# 一键做出镜像 homeeye/go2rtc:1.1.3-ptz
+# 一键做出镜像 homeeye/go2rtc:1.1.4-ptz
 sh tools/build-go2rtc-ptz.sh
 ```
 

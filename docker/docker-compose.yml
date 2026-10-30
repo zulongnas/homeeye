@@ -60,7 +60,7 @@ services:
       # 需要小米摄像头：先 sh tools/fetch-miloco-sdk.sh，再放开这两行。
       # args:
       #   HE_WITH_MILOCO_SDK: "1"
-    image: ghcr.io/zulongnas/homeeye:1.1.3
+    image: ghcr.io/zulongnas/homeeye:1.1.4
     container_name: homeeye
     restart: unless-stopped
     network_mode: host

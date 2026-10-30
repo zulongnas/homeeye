@@ -17,6 +17,29 @@ sh tools/pack-fpk.sh            # 产出 homeeye.fpk（用官方 fnpack 校验 +
 装完打开是**零配置**：没有摄像头、没有米家账号、没有录像。安装向导只问一件事——
 录像往哪个目录写（不知道选啥就留空，用飞牛给本应用开的共享目录）——第一件事仍然是设登录密码。
 
+## fpk 不装运行环境（装之前先看这一节）
+
+.fpk 里只有本项目的代码，运行时全靠宿主机：
+
+| 依赖 | 要求 | 缺了的表现 |
+|---|---|---|
+| `python3` | 3.9+（飞牛系统自带 3.11.2 实测可用） | 服务起不来；`cmd/main` 会在安装日志里直接写「缺少 python3」 |
+| `ffmpeg` | 4.x+（飞牛系统自带 4.4+） | 能进页面，但没有画面、没有录像；运行环境自检会标红 |
+| 小米 SDK 的 Python 依赖 | 仅小米摄像头需要；**fpk 不代装** | 小米那一路 0 帧；自检会列出缺哪些包 |
+
+只接 RTSP / ONVIF 摄像头的话，上面前两行飞牛都自带，装完就能用。
+要用小米摄像头，在宿主机上先取 SDK（`sh tools/fetch-miloco-sdk.sh`，许可原因不随包分发），
+再装它的依赖：
+
+```sh
+pip3 install aiohttp aiofiles requests cryptography av numpy \
+             pydantic PyYAML psutil qrcode Pillow
+```
+
+装完登录进 **设置 → 链路检查**，顶部「运行环境」一行会给出自检结论；
+服务日志（`/vol1/@appdata/homeeye/info.log`）里也有 `[env]` 开头的几行。
+
+
 ## 包结构（本仓库根目录就是 fnpack 的源目录）
 
 ```

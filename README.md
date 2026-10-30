@@ -63,6 +63,27 @@ Docker 默认 bridge 的 NAT 会把打洞打歪 —— 表现为 `PPCS_Connect e
 macOS/Windows 的 Docker Desktop 没有可用 host 网络，那种环境用
 `docker/docker-compose.bridge.yml`，代价是上面两项功能不可用。
 
+### 运行环境由谁装（Docker / fpk / 裸跑 不一样）
+
+| 依赖 | Docker | fpk（飞牛） | 裸跑 |
+|---|---|---|---|
+| Python | 镜像自带 3.12 | **宿主机的 python3.9+**（不附带，缺了服务起不来） | 自己装 3.9+ |
+| ffmpeg | 镜像自带 | **宿主机自带**（飞牛系统里有 4.x；缺了就没画面） | 自己装 4.x+ |
+| RTSP / ONVIF | 开箱可用 | 开箱可用 | 开箱可用 |
+| 小米 SDK | 用户自取 + `HE_WITH_MILOCO_SDK=1` 重建镜像 | 用户自取 SDK，**Python 依赖要自己在宿主机装** | 同 fpk |
+| 小米 SDK 的 Python 依赖 | 重建时自动装（`docker/requirements-xiaomi.txt`） | 不装，需手动 pip | 手动 pip |
+
+小米那一路的依赖（fpk / 裸跑在宿主机执行一次，Docker 不用）：
+
+```sh
+pip3 install aiohttp aiofiles requests cryptography av numpy \
+             pydantic PyYAML psutil qrcode Pillow
+```
+
+**装完怎么确认**：登录后进 **设置 → 链路检查**，顶部会有一行「运行环境」自检，
+缺什么直接写在那里（缺失的、需要你自己装的都点名）；服务日志里也有
+`[env]` 开头的几行。Docker 用户不用管这一节 —— 除了小米 SDK，镜像是自包含的。
+
 ## 功能
 
 | 能力 | 状态 | 备注 |
