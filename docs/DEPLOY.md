@@ -317,6 +317,25 @@ scrape_configs:
 | 并发与恢复 | 6 观看端同时开播；kill 发布进程；切视图 | ffmpeg 峰值 1 路；kill 后 tick 2 秒内重起，浏览器约 10 秒内自动恢复；切视图后服务端订阅归 0 |
 | 浏览器真机 | Chrome 两路网格 / 单画面主码流，连续播放 60 秒 + 中断恢复 | 无 MediaError / NetworkError，currentTime 持续前进，控制台无一条 warn/error |
 
+**1.2.1 发版与上线（2026-10-31）：**
+
+| 项 | 结果 |
+|---|---|
+| 分支 | `main` @ `5e51dc1`（9 文件，+194/−42） |
+| tag / Release | `v1.2.1`；Release 附件 `homeeye.fpk` 5,776,434 B，md5 `ec24b336789bc536b1c12bf0226cc2a6`，sha256 `a6a68fa4…` |
+| GHCR 构建 | run `41146994295`（version=1.2.1、go2rtc=v1.9.15），`homeeye 本体` 与 `go2rtc（云台补丁版）` 全绿 |
+| GHCR 匿名 manifest | `homeeye:1.2.1` → `sha256:be1b64f1664464fff7a9e55b66e97a76efc89a16cab1e73b2759dd5e1a9e4acd`（无凭据可取） |
+| 附件校验 | 本机直链下载仍被网络拦（同 1.2.0），改用 REST 校验：附件 5,776,434 B、`sha256=a6a68fa4…` 与 GitHub 记录的 digest 一致 |
+| NAS 切换 | 源换为本地打包的 1.2.1 发布树（tar → SFTP）→ 本地构建 `homeeye-nas:1.2.1`（`HE_WITH_MILOCO_SDK=1`）→ `docker compose up -d homeeye`；6 秒到 `healthy` |
+| 切换后自检 | `/api/health` → `version 1.2.1`、两路摄像头 `ok`；两路网格观看时 `docker top` 里**恰好 2 个** ffmpeg（每路 1 个） |
+| 真机浏览器回归 | 生产同镜像临时实例（18997，同配置）两路播放 ≥90 秒：currentTime 持续前进、无 MediaError/NetworkError；控制台只有登录前 401 与启动期 health 503（摄像头 P2P 预热），无解码错误 |
+| 中断恢复 | `kill -9` 掉 c1 子码流 ffmpeg：服务端 1 秒内重起、总数仍为 2；前端无需手动刷新，约 6–8 秒自动恢复播放 |
+| 回滚路径 | NAS 上 `/tmp/homeeye-src-1.2.0.tgz` + 同目录 `src.old`；`homeeye-nas:1.2.0` 镜像仍在，compose 的 image 改回 `1.2.0` 再 `up -d` 即回滚 |
+
+已知行为（不影响本次修复，记录在案）：发布进程被重启后，仍在线的观看端会在同一条
+连接里收到一条从零开始的新时间线，mpegts.js 会丢弃重叠音频帧并停住画面，由前端看门狗
+兜底重建（6–8 秒）。后续可改为"发布进程重启即断开观看端"，让浏览器直接换新播放器。
+
 ### 没验证的（别照着这些吹）
 
 
