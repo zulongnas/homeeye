@@ -510,6 +510,8 @@ class XiaomiStreamer(object):
         # 直播这一路实际是直拷还是转码 + 为什么（页面要能当场查出双转码没消掉）
         self.effective = ""
         self.mode_note = ""
+        # 录像那一路怎么处理（直拷 / 因遮蔽重编码），给状态页照实说
+        self.rec_note = ""
         self._last_active = time.time()
 
         # ---- 音频通道 ----
@@ -569,10 +571,14 @@ class XiaomiStreamer(object):
             return len(self._subs)
 
     def status(self):
+        import nw_config as _C
+        import nw_privacy as PV
         return {"alive": self.alive(), "subs": self.subscribers(),
                 "frames": self.frames, "error": self.error,
                 "audio_frames": self.audio_frames, "audio_bytes": self.audio_bytes,
                 "video": self.effective, "video_note": self.mode_note,
+                "rec_note": self.rec_note,
+                "privacy": PV.summary(_C.get_camera(self.cam_id)),
                 "codec": self.codec,
                 "uptime": int(time.time() - self.started_at) if self.started_at else 0}
 
@@ -710,13 +716,21 @@ class XiaomiStreamer(object):
           * 直播 → 浏览器：H.265 必须转 H.264（浏览器 MSE / mpegts.js 解不了 HEVC，
             表现就是接口 HTTP 200、字节也在流、前端却一直"拉流失败/无画面"）；
             源本来就是 H.264 时不用转，直拷即可 —— 这就是 live.transcode=auto。
-          * 录像 → 磁盘：永远 -c:v copy 原码流直拷，不重编码 —— 画质无损、
-            不额外吃 CPU，这也是录像体积与摄像机原生一致的原因。
+            但配了隐私遮蔽时**必须转**：遮蔽是滤镜，只有重编码才烧得进像素。
+          * 录像 → 磁盘：默认 -c:v copy 原码流直拷，不重编码 —— 画质无损、
+            不额外吃 CPU，这也是录像体积与摄像机原生一致的原因。配了遮蔽时改
+            为重编码：录进去的就必须是打过码的画面。
         """
         live = _live_opts()
         # 这一路不需要探测：codec 是首帧 NAL 头判出来的真实编码。
         import nw_live as LV
-        need, _note = LV.transcode_needed(LV._tmode(live.get("transcode")), codec)
+        import nw_config as _C
+        import nw_privacy as PV
+        # 隐私遮蔽按 cam_id 现取：这一路重建 ffmpeg 时读的就是当时配置里的遮罩，
+        # 改了遮蔽由 reconcile 重起这条流后生效。
+        mask_vf = PV.filters(_C.get_camera(self.cam_id))
+        need, _note = LV.transcode_needed(LV._tmode(live.get("transcode")),
+                                          codec, bool(mask_vf))
         transcode = need
         self.effective = "transcode" if transcode else "copy"
         self.mode_note = _note
@@ -764,6 +778,7 @@ class XiaomiStreamer(object):
             if tw > 0:
                 # 只缩不放：源比目标小时保持原尺寸
                 vf.append("scale='min(iw,%d)':-2" % tw)
+            vf += mask_vf          # 先缩后涂：drawbox 的 iw/ih 是它自己输入的尺寸
             if vf:
                 cmd += ["-vf", ",".join(vf)]
             if tfps > 0:
@@ -779,7 +794,7 @@ class XiaomiStreamer(object):
                 "-max_interleave_delta", "1000000",
                 "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
 
-        # ---- 输出 2：录像分段 MP4（原码流直拷，不重编码）----
+        # ---- 输出 2：录像分段 MP4（默认原码流直拷；配了遮蔽则重编码）----
         if self.record and self.record_dir:
             try:
                 # segment muxer 不会自动创建 %Y/%m/%d 多级目录，直接平铺到
@@ -792,9 +807,23 @@ class XiaomiStreamer(object):
                 #   "Could not write header (incorrect codec parameters ?)"
                 # 结果是录像一个文件都写不出来（直播那一路不受影响，很容易漏看）。
                 cmd += [
-                    "-map", "0:v:0"] + a_map + [
-                    "-c:v", "copy", "-bsf:v", "extract_extradata",
-                ]
+                    "-map", "0:v:0"] + a_map
+                if mask_vf:
+                    # 录像也要带遮蔽 —— 否则"实时看着是黑的、拖回放一看原形毕露"，
+                    # 那正是区域遮蔽要避免的事。代价：这一路的录像从直拷变成重编码。
+                    cmd += [
+                        "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", str(crf), "-pix_fmt", "yuv420p",
+                        "-vf", ",".join(mask_vf),
+                        "-force_key_frames", "expr:gte(t,n_forced*%d)" % (
+                            max(1, self.segment_minutes) * 60),
+                    ]
+                    self.rec_note = "录像带遮蔽，已重编码（不直拷）"
+                else:
+                    cmd += [
+                        "-c:v", "copy", "-bsf:v", "extract_extradata",
+                    ]
+                    self.rec_note = "录像原码流直拷（不重编码）"
                 if afd_w is not None:
                     cmd += ["-c:a", "aac", "-b:a", "64k", "-ar", "44100", "-ac", "1"]
                 cmd += [
@@ -840,11 +869,17 @@ class XiaomiStreamer(object):
             else:
                 self._afd = None
         with self._lock:
+            replaced = self._ffmpeg is not None
             self._ffmpeg = proc
             # 新进程的 TS 流（PAT/PMT、编码参数）和旧的不连续，旧缓冲里的字节
             # 喂给新订阅者只会解出错帧 —— 清掉，等新流自己攒出第一个 IDR。
             self._ring.clear()
             self._ring_len = 0
+            old_subs = list(self._subs) if replaced else []
+        # 编码切换会重建 ffmpeg，新时间线和老观看端接不上（PTS 断裂）。
+        # 主动断开，让浏览器立刻重连到新流，而不是原地卡住等看门狗。
+        for s in old_subs:
+            s.close()
         asyncio.ensure_future(self._pump_ts(proc))
         asyncio.ensure_future(self._pump_err(proc))
         return proc
@@ -1163,8 +1198,13 @@ class XiaomiHub(object):
                     self._streamers.pop(cid, None).stop()
 
     def get(self, cam, record_dir="", segment_minutes=5):
+        import nw_privacy as PV
         cid = str(cam.get("id"))
-        sig = (cam.get("did"), cam.get("channel"), cam.get("quality"))
+        # 遮蔽区域进签名：改了罩子必须重建这条流（滤镜是启动时定死的，运行中
+        # 加不上）。没改的人不受影响 —— 签名相同就还是原来那一台 ffmpeg。
+        sig = (cam.get("did"), cam.get("channel"), cam.get("quality"),
+               tuple((m["x"], m["y"], m["w"], m["h"])
+                     for m in PV.masks_of(cam)))
         with self._lock:
             st = self._streamers.get(cid)
             if st is None or getattr(st, "_sig", None) != sig:

@@ -17,9 +17,11 @@ import subprocess
 import threading
 import time
 
+import nw_privacy as PV
+
 _lock = threading.RLock()
 _procs = {}      # cam_id -> Popen
-_urls = {}       # cam_id -> 这一路当前实际在录的地址（换源时要靠它发现该重起）
+_urls = {}       # cam_id -> (在录的地址, 遮蔽滤镜)；换源或改遮蔽都靠它发现该重起
 _thr = {}        # cam_id -> Thread
 _errs = {}       # cam_id -> 最后一条 ffmpeg 报错
 _started = {}    # cam_id -> 进程启动时刻（用来识别「起来就挂」）
@@ -121,7 +123,8 @@ def source_note(cam, source="PLAYED"):
             "回放页会走实时转码那一条路" % raw_url_of(cam))
 
 
-def seg_cmd(cam, root, segment_minutes, record_audio=True, source="PLAYED"):
+def seg_cmd(cam, root, segment_minutes, record_audio=True, source="PLAYED",
+            crf=23):
     # 平铺到单层目录（cam_dir 已预先 mkdir），文件名带日期：
     #   root/c2/20261029-143000.mp4
     # 不用 %Y/%m/%d 多级目录——ffmpeg segment muxer 不会自动建目录，
@@ -156,8 +159,21 @@ def seg_cmd(cam, root, segment_minutes, record_audio=True, source="PLAYED"):
         # "Error muxing a packet" 退出 —— 那样录像进程就没了。
         # 实测只映射视频时零告警、产物正常。
         cmd += ["-an"]
+    mask_vf = PV.filters(cam)
+    if mask_vf:
+        # 隐私遮蔽要烧进像素，录像就必须重编码（copy 改不了画面）。分段边界靠
+        # -force_key_frames 落在每 segment 的起点，否则切片点不在关键帧上，
+        # 回放拖过去会花一段。CRF 用设置页「实时画面质量」同一个数。
+        cmd += [
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", str(min(31, max(1, int(crf)))), "-pix_fmt", "yuv420p",
+            "-vf", ",".join(mask_vf),
+            "-force_key_frames",
+            "expr:gte(t,n_forced*%d)" % (int(segment_minutes) * 60),
+        ]
+    else:
+        cmd += ["-c:v", "copy"]
     cmd += [
-        "-c:v", "copy",
         "-f", "segment",
         "-segment_time", str(int(segment_minutes) * 60),
         "-reset_timestamps", "1",
@@ -386,10 +402,14 @@ class Recorder(object):
             for cid, cam in want.items():
                 st = cfg.get("storage") or {}
                 url_now = record_url(cam, st.get("source") or "PLAYED")
+                # 遮蔽改了也要重起：ffmpeg 手里的滤镜组是启动时定死的，运行中
+                # 加不上。把它并进"这一路当前在录什么"的签名里，换源那段现成的
+                # 重起逻辑就顺带把遮蔽变更也管了。
+                sig = (url_now, tuple(PV.filters(cam)))
                 p = _procs.get(cid)
                 if p is not None:
                     if p.poll() is None:
-                        if _urls.get(cid) == url_now:
+                        if _urls.get(cid) == sig:
                             continue
                         # 源换了（RAW/PLAYED 来回切，或地址改了）：ffmpeg 手里那条
                         # RTSP 连接属于被换掉的旧流，它自己不会重连到新流，只能掐掉
@@ -410,7 +430,8 @@ class Recorder(object):
                 os.makedirs(cam_dir(root, cid), exist_ok=True)
                 cmd = seg_cmd(cam, root, st.get("segment_minutes") or 5,
                               record_audio=bool(st.get("record_audio", True)),
-                              source=st.get("source") or "PLAYED")
+                              source=st.get("source") or "PLAYED",
+                              crf=(cfg.get("live") or {}).get("quality") or 23)
                 try:
                     pr = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                           stderr=subprocess.PIPE, close_fds=True)
@@ -418,7 +439,7 @@ class Recorder(object):
                     _errs[cid] = "启动录像失败：%s" % e
                     continue
                 _procs[cid] = pr
-                _urls[cid] = url_now
+                _urls[cid] = sig
                 _started[cid] = time.time()
                 _errs.pop(cid, None)
                 threading.Thread(target=_err_reader, args=(cid, pr), daemon=True).start()
@@ -445,8 +466,10 @@ class Recorder(object):
         with _lock:
             out = {}
             for cid, p in _procs.items():
+                sig = _urls.get(cid) or ("", ())
                 out[cid] = {"running": p.poll() is None, "pid": p.pid,
-                            "url": _urls.get(cid, ""),
+                            "url": sig[0] if isinstance(sig, tuple) else sig,
+                            "masked": bool(isinstance(sig, tuple) and sig[1]),
                             "error": _errs.get(cid, "")}
             for cid, b in _backoff.items():
                 if b.get("n") and b.get("until", 0) > time.time():

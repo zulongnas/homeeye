@@ -86,6 +86,9 @@ DEFAULT = {
         "arming_ranges": "",        # 布防时段："22:00-08:00,12:00-14:00"
         "digest_enabled": False,    # 每日日报
         "digest_hour": 20,          # 日报发送小时（0-23）
+        # 通知里深链接的前缀（形如 https://nas.example:8443）。填了消息里才会
+        # 带"点进来看这一段"；留空就只发文字 —— 不给出打不开的链接。
+        "link_base": "",
     },
     # 看门狗：管心跳（巡检/录像循环停转就补线程），也管自愈（断链重建、IP 漂移）。
     # 冷却与"最多修几次"是这一层的刹车 —— 没有它，一条真坏掉的链路会被无限重试，
@@ -108,6 +111,45 @@ DEFAULT = {
         "salt": "",
         "pw_hash": "",
         "session_hours": 24,
+    },
+    # 多用户（1.3-10）。空列表 = 只有上面那一个 admin（老配置零迁移）。
+    # 每项：{name, role: "admin"|"read", salt, pw_hash, cams: [id…], created}
+    # cams 为空列表 = 能看全部摄像头；只读用户建议只给客厅/门口那几路。
+    "users": [],
+    # 本地 AI（1.3-5）。三条能力各自独立开关，缺依赖时页面会如实说缺什么：
+    #   audio_events —— 纯标准库，对录像分段做 RMS 突变，只标「声响」不做分类
+    #   objects      —— 需要 numpy + onnxruntime + 一个 YOLO .onnx 模型文件
+    #   vlm_*        —— 事件截图发给 OpenAI 兼容的多模态接口写一句话描述
+    "ai": {
+        "enabled": False,
+        "audio_events": True,
+        "audio_threshold": 2.5,     # 相对本底中位数的倍数，越大越迟钝
+        "objects": False,
+        "model_path": "",           # .onnx 绝对路径（容器内）
+        "labels": "",               # 逗号分隔；空 = 内置 人/车/宠物 八类
+        "input_size": 640,          # 模型输入边长（固定尺寸的模型会自适配）
+        "obj_confidence": 0.35,     # 0.05~0.95
+        "vlm_enabled": False,
+        "vlm_url": "",              # https://.../v1
+        "vlm_key": "",              # 不回显
+        "vlm_model": "",
+    },
+    # 冷层归档（1.3-7）：把比 older_days 更老的录像段用 rclone 搬到云端。
+    # 二进制必须在容器里能找到（HE_RCLONE 指定路径），找不到时页面直说不搬。
+    "archive": {
+        "enabled": False,
+        "remote": "",               # 形如 cloud:homeeye-cold
+        "older_days": 30,
+        "delete_local": False,      # 搬成功并核对字节后才删
+        "auto": False,
+        "auto_hour": 4,
+    },
+    # 完整性自检（1.3-7）：按分段起始时间找空洞。gap_tolerance 留了余量，
+    # 因为分段本身有 ±数秒的抖动，太敏感会把正常录像报成"丢了一段"。
+    "integrity": {
+        "enabled": True,
+        "days": 7,
+        "gap_tolerance": 1.5,
     },
     # 云台（PTZ）侧车。小米云台走 Mi Home 的 miss 私有命令，需要米家账号的
     # userId + passToken（不是扫码登录拿到的 OAuth token）。装了 go2rtc 的机器
@@ -141,7 +183,9 @@ _cache = {"mtime": None, "data": None}
 # kind: int / num / bool / text；数值项给 (下限, 上限)，越界取边界并记账。
 RULES = {
     "storage": {
-        "retention_days": ("int", 0, 3650),      # 0 = 不自动删
+        # 上限 365 天：隐私与合规那条要求「不许把保留期配成事实上的永久」。
+        # 0 仍然是「不自动删」——那是明确的运维选择，页面与文档都会点名它。
+        "retention_days": ("int", 0, 365),
         "segment_minutes": ("int", 1, 180),      # 小于 1 分钟会把磁盘 inode 刷爆
         "budget_gb": ("num", 0, 100000),         # 0 = 不限容量
         "record_mode": ("choice", ("continuous", "off")),
@@ -191,6 +235,35 @@ RULES = {
         "enabled": ("bool",),
         "username": ("text",),
         "session_hours": ("num", 1, 720),
+    },
+    "ai": {
+        "enabled": ("bool",),
+        "audio_events": ("bool",),
+        "audio_threshold": ("num", 1.2, 20),
+        "objects": ("bool",),
+        "model_path": ("text",),
+        "labels": ("text",),
+        "input_size": ("int", 160, 1280),
+        "obj_confidence": ("num", 0.05, 0.95),
+        "vlm_enabled": ("bool",),
+        "vlm_url": ("text",),
+        "vlm_key": ("text",),
+        "vlm_model": ("text",),
+    },
+    "archive": {
+        "enabled": ("bool",),
+        "remote": ("text",),
+        "older_days": ("int", 1, 3650),
+        "delete_local": ("bool",),
+        "auto": ("bool",),
+        "auto_hour": ("int", 0, 23),
+    },
+    "integrity": {
+        "enabled": ("bool",),
+        # 上限跟 nw_integrity.scan() 的 62 天一致：这里放 90 的话，页面上填 90
+        # 能存进去，实际扫出来只有 62 天 —— 存的就不是跑的了。
+        "days": ("int", 1, 62),
+        "gap_tolerance": ("num", 1.0, 6.0),
     },
     "ptz": {
         "enabled": ("bool",),

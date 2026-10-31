@@ -36,7 +36,7 @@ pip3 install aiohttp aiofiles requests cryptography av numpy \
              pydantic PyYAML psutil qrcode Pillow
 ```
 
-装完登录进 **设置 → 链路检查**，顶部「运行环境」一行会给出自检结论；
+装完登录进 **设置 → 链路健康**，顶部「运行环境」一行会给出自检结论；
 服务日志（`/vol1/@appdata/homeeye/info.log`）里也有 `[env]` 开头的几行。
 
 

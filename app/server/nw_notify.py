@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import smtplib
 import threading
 import time
@@ -27,6 +28,15 @@ import nw_config as C
 # 同一类通知的最短重发间隔（key -> 上次发送时间戳）
 _last_sent = {}
 _send_lock = threading.Lock()
+
+# 通知正文里可能夹着 ffmpeg 的报错原话，而那句里通常带着完整的
+# rtsp://用户:口令@地址 —— 邮件会进收件箱、Webhook 会进第三方日志，
+# 所以出门前统一抹掉，不指望每个调用点自己记得。
+_URL_CRED_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s]+:)[^@\s]+@")
+
+
+def _mask_creds(text):
+    return _URL_CRED_RE.sub(r"\1***@", str(text or ""))
 
 _dig_lock = threading.Lock()
 _dig_last_date = ""
@@ -195,6 +205,7 @@ def send(subject, text):
 
     返回 (是否有任一渠道成功, 各渠道结果说明)。
     """
+    subject, text = _mask_creds(subject), _mask_creds(text)
     nt = C.load().get("notify") or {}
     results = []
 
@@ -305,18 +316,32 @@ def notify_motion(cam_name, when=None):
     )
 
 
-def notify_local_event(cam_name, count, first_ts):
-    """本地事件侦测扫出事件后的通知（受布防影响，与设备侧移动通知共用冷却键）。"""
+def notify_local_event(cam_name, count, first_ts, labels=None, cam_id="", t0=0):
+    """本地事件侦测扫出事件后的通知（受布防影响，与设备侧移动通知共用冷却键）。
+
+    有 `notify.link_base`（形如 https://nas.example:8443）时消息里带一条深链，
+    点开直接落到那一段回放 —— 没有配置就老实只发文字，不编一个打不开的链接。
+    """
     cfg = C.load()
     nt = cfg.get("notify") or {}
     if not nt.get("on_motion", True):
         return False, "未开启移动侦测通知"
     when = time.strftime("%H:%M:%S", time.localtime(first_ts))
+    tags = [str(x) for x in (labels or []) if x][:6]
+    what = "、".join(tags) if tags else "动静"
+    link = (nt.get("link_base") or "").strip().rstrip("/")
+    href = ""
+    if link and cam_id:
+        href = "%s/#event=%s@%d" % (link, cam_id, int(t0 or first_ts))
+    body = ("摄像头「%s」的录像分段里侦测到 %d 段%s（第一段 %s）。"
+            % (cam_name, count, what, when))
+    if href:
+        body += "\n\n点开直接看这一段：%s" % href
+    else:
+        body += "\n\n可登录 HomeEye 在时间轴上直接跳到这些时段。"
     return notify(
-        "【HomeEye】%s 检测到 %d 段动静" % (cam_name, count),
-        "摄像头「%s」的录像分段里侦测到 %d 段有动静（第一段 %s）。\n\n"
-        "可登录 HomeEye 在时间轴上直接跳到这些时段。"
-        % (cam_name, count, when),
+        "【HomeEye】%s：%s %d 段" % (cam_name, what, count),
+        body,
         key="motion:%s" % cam_name,
         cooldown=60,
         need_arm=True,

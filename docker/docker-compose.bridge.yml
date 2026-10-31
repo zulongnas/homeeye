@@ -40,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: ghcr.io/zulongnas/homeeye:1.2.1
+    image: ghcr.io/zulongnas/homeeye:1.3.0
     container_name: homeeye
     restart: unless-stopped
     depends_on:

@@ -22,7 +22,7 @@ curl -s http://127.0.0.1:8088/api/health | head -c 300
 
 | 镜像 | 是什么 | 备注 |
 |---|---|---|
-| `ghcr.io/zulongnas/homeeye:1.2.1` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它 |
+| `ghcr.io/zulongnas/homeeye:1.3.0` | 本体（Python + ffmpeg） | **不含小米 SDK**（许可不允许再分发），RTSP/ONVIF 全都用它；对象识别要的 `onnxruntime` 与 rclone 也**不在镜像里**（可选旁路，见 README） |
 | `ghcr.io/zulongnas/homeeye-go2rtc-ptz:1.9.15` | go2rtc 官方 `master-hardware` + 云台/对讲补丁 | tag 是 go2rtc 的上游版本（它只在换上游时变）；换回 `alexxit/go2rtc:master-hardware` 也能拉流硬转 |
 
 要改代码、要小米 SDK、或者不想用别人构建的镜像，就用本地构建（镜像名不变，
@@ -179,9 +179,14 @@ cd docker && docker compose pull && docker compose up -d   # 换新镜像，data
 
 配置格式向后兼容：老配置里的 `live.transcode: true/false` 会自动翻成
 `always/never`（升级不改行为）。回滚 = 换回旧 tag 的镜像再起一次；
-`data/` 不需要动，也没有数据库迁移。新版镜像在
-[Releases](https://github.com/zulongnas/homeeye/releases) 里能找到对应版本号
-（tag 就是镜像 tag，例如 `1.2.1`）。
+`data/` 不需要动，也没有数据库迁移。**但 1.3.0 往 `config.json` 里加了几段新配置**
+（`users` 多用户、`ai` 本地 AI、`archive` 归档、`integrity` 自检、每路的 `privacy` 遮蔽）：
+回滚到 1.2.x 时这些键会原样躺在文件里但**不再被执行** —— 只读账号会失效（老版本只认
+`auth.username` 那一个口令），遮蔽不再烧进像素，审计不再新增。所以：
+回滚前先 `cp data/config.json data/config.json.bak-$(date +%F)`，
+并且**回滚期间不要把分享链接留在外面**。
+新版镜像在 [Releases](https://github.com/zulongnas/homeeye/releases) 里能找到对应版本号
+（tag 就是镜像 tag，例如 `1.3.0`）。
 
 ## 七、监控接入（Prometheus / Grafana）
 

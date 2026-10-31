@@ -33,8 +33,13 @@
     picks: [],        // 每一格放哪台摄像头（空串 = 该格留空）
     muted: true,      // 是否静音（默认静音：浏览器不允许无交互自动出声）
     view: "live",
+    auth: { logged_in: false, admin: false, role: "", username: "", cams: [] },
+    roleSig: null,
     ptz: { available: false, reason: "" },   // 云台侧车是否可用
     ptzOpen: "",                              // 当前展开方向盘的摄像头 id
+    speed: 1,                                 // 回放倍速
+    masks: [],                                // 摄像头弹窗里正在编辑的遮蔽区域
+    notif: { last: 0, on: false },            // 浏览器通知轮询水位
     play: { cam: null, day: null, segs: [], seg: null, playhead: 0, dayStart: 0,
             evs: [], auto: true, offsetBase: 0 }
   };
@@ -140,7 +145,21 @@
   });
 
   /* ------------------------------------------------------------ 实时画面 */
-  var tiles = {};   // camId -> {video, player, tile}
+  /* tiles: camId -> entry{video, player, tile, cam, tier, parked, prewarm}
+     切布局时**不销毁还在台上的那几路**：DOM 节点只是换了个位置，播放器和
+     MSE 缓冲原样保留 —— 这正是"1/2/4/6/9 秒切"的关键。以前每次 mountTiles
+     都 unmountTiles + 全量重建，4~9 路播放器同时重新拉流，2~5 秒就出在这里。
+     暂时离开画面的那几路先进停车场（离屏 1px 容器）保留 30 秒，快速切回来
+     时连缓冲都还在；超过 30 秒再真正销毁，不占服务端和 CPU。 */
+  var tiles = {};
+  var PARK_MS = 30000;
+  var prewarmTimer = null;
+
+  var tilePark = document.createElement("div");
+  tilePark.id = "tilePark";
+  tilePark.className = "tile-park";
+  tilePark.setAttribute("aria-hidden", "true");
+  document.body.appendChild(tilePark);
 
   function destroyPlayer(entry) {
     if (!entry) return;
@@ -155,16 +174,104 @@
     }
   }
 
-  function unmountTiles() {
-    Object.keys(tiles).forEach(function (k) {
-      destroyPlayer(tiles[k]);
-    });
+  function destroyShadow(entry) {
+    if (!entry) return;
+    var sh = entry.shadow;
+    entry.shadow = null;
+    entry.upSeq = (entry.upSeq || 0) + 1;
+    if (!sh) return;
+    clearTimeout(sh.timer);
+    try { sh.player.destroy(); } catch (e) {}
+    if (sh.video && sh.video.parentNode) sh.video.parentNode.removeChild(sh.video);
+  }
+
+  function destroyEntry(entry) {
+    if (!entry || entry.destroyed) return;
+    entry.destroyed = true;
+    clearTimeout(entry.parkTimer);
+    clearTimeout(entry.retryTimer);
+    destroyShadow(entry);
+    destroyPlayer(entry);
+    if (entry.tile && entry.tile.parentNode) entry.tile.parentNode.removeChild(entry.tile);
+    if (entry.cam) {
+      if (tiles[entry.cam.id] === entry) delete tiles[entry.cam.id];
+      delete liveWatch.seen[entry.cam.id];
+    }
+  }
+
+  function parkTile(entry, keep) {
+    if (!entry || entry.destroyed || entry.parked) return;
+    entry.parked = true;
+    entry.prewarm = !!keep;
+    entry.tile.classList.add("parked");
+    tilePark.appendChild(entry.tile);
+    if (entry.video) entry.video.muted = true;
+    clearTimeout(entry.parkTimer);
+    entry.parkTimer = keep ? null : setTimeout(function () {
+      if (entry.parked) destroyEntry(entry);
+    }, PARK_MS);
+  }
+
+  function reviveTile(entry) {
+    if (!entry) return;
+    entry.parked = false;
+    entry.prewarm = false;
+    clearTimeout(entry.parkTimer);
+    entry.parkTimer = null;
+    entry.tile.classList.remove("parked");
+    // 停车期间流断过（发布进程重启 / 服务端收尾）：切回来时立刻重连，
+    // 否则会停在最后一帧等看门狗。
+    if (entry.ended) {
+      entry.ended = false;
+      scheduleRetry(entry, true);
+    }
+  }
+
+  function teardownAllTiles() {
+    clearTimeout(prewarmTimer);
+    prewarmTimer = null;
+    Object.keys(tiles).forEach(function (k) { destroyEntry(tiles[k]); });
     tiles = {};
     liveWatch.seen = {};
     if (liveWatch.timer) {
       clearInterval(liveWatch.timer);
       liveWatch.timer = null;
     }
+  }
+
+  function unmountTiles() {
+    teardownAllTiles();
+    var grid = $("grid");
+    if (grid) grid.innerHTML = "";
+  }
+
+  /* 预热：当前没上墙的摄像头在后台先拉一路子码流并停在停车场。
+     用户点 2→4/6/9 时，新出现的那几格已经有缓冲，直接出画面。
+     只预热 3 路、且进实时页 4 秒后才开始，避免一打开页面就把 NAS 打满。 */
+  var PREWARM_MAX = 3;
+  function schedulePrewarm(visible) {
+    clearTimeout(prewarmTimer);
+    prewarmTimer = setTimeout(function () {
+      if (state.view !== "live" || state.focusId) return;
+      var budget = PREWARM_MAX;
+      Object.keys(tiles).forEach(function (k) {
+        var e = tiles[k];
+        if (e && !e.destroyed && e.parked && e.prewarm) budget--;
+      });
+      for (var i = 0; i < state.cams.length && budget > 0; i++) {
+        var c = state.cams[i], id = String(c.id);
+        if (visible[id] || c.enabled === false) continue;
+        if (tiles[id] && !tiles[id].destroyed) continue;
+        // 已知离线（服务端报了错且没有在跑）就别拉，省得进重连循环
+        if (c.live && c.live.alive === false && c.live.error) continue;
+        makeTile(c, false);
+        var ent = tiles[id];
+        if (ent) {
+          parkTile(ent, true);
+          budget--;
+        }
+      }
+    }, 4000);
   }
 
   /* 实时画面看门狗：时间戳跳变（摄像机重连、ffmpeg 重启）时 MSE 会**悄悄**
@@ -177,7 +284,13 @@
     if (state.view !== "live") return;
     Object.keys(tiles).forEach(function (k) {
       var e = tiles[k];
-      if (!e || !e.video || !e.cam) return;
+      if (!e || e.destroyed || !e.video || !e.cam) return;
+      // 停车场的这一路不参与卡死检测；但它要是报了硬错误（设备离线 /
+      // 预热时根本连不上），直接销毁，别让一个死播放器在后台反复耗着重连。
+      if (e.parked) {
+        if (e.tile && e.tile.querySelector(".tile-err")) destroyEntry(e);
+        return;
+      }
       var v = e.video;
       var s = liveWatch.seen[k] || (liveWatch.seen[k] = { t: -1, stalls: 0 });
       // 还没起播（等关键帧/刚加载）不算卡住：交给 ERROR 重试和首段等待
@@ -192,7 +305,7 @@
           s.t = -1;
           s.stalls = 0;
           showTileErr(e.tile, e.cam, "画面卡住，正在重连…");
-          scheduleRetry(v, e.tile, e.cam, e.tier, 0);
+          scheduleRetry(e, true);
         }
       } else {
         s.stalls = 0;
@@ -326,18 +439,17 @@
   function mountTiles() {
     var grid = $("grid");
     var hint = $("emptyHint");
-    unmountTiles();
-    grid.innerHTML = "";
-    var t0 = $("emptyHint");
 
     if (!state.cams.length) {
-      t0.hidden = false;
+      teardownAllTiles();
+      grid.innerHTML = "";
+      hint.hidden = false;
       grid.style.display = "none";
       $("btnFullscreen").hidden = true;
       if ($("pickBar")) { $("pickBar").hidden = true; }
       return;
     }
-    t0.hidden = true;
+    hint.hidden = true;
     grid.style.display = "";
 
     var slots = gridCount();
@@ -350,18 +462,58 @@
     if (state.focusId) picks = [String(state.focusId)];
 
     grid.className = "grid n" + n;
+
+    // ---- 目标布局：第 i 格该放哪台 ----
+    var want = [], visible = {};
     for (var i = 0; i < n; i++) {
       var cam = camById(picks[i]);
-      grid.appendChild(cam ? makeTile(cam, n === 1) : blankTile(n === 1));
+      want.push(cam);
+      if (cam) visible[String(cam.id)] = true;
     }
-    $("btnFullscreen").hidden = false;
+
+    // 1) 不在目标里的那几路进停车场（保留播放器与缓冲，30 秒内切回秒开）
+    Object.keys(tiles).forEach(function (k) {
+      var e = tiles[k];
+      if (!e || e.destroyed) return;
+      if (!visible[k]) {
+        if (!e.parked) parkTile(e);
+      }
+    });
+
+    // 2) 留在台上的复用原 tile / 播放器，只做换位；新出现的才新建
+    var nodes = [];
+    for (var j = 0; j < n; j++) {
+      var c = want[j];
+      if (!c) { nodes.push(blankTile(n === 1)); continue; }
+      var ent = tiles[String(c.id)];
+      if (ent && !ent.destroyed) {
+        reviveTile(ent);
+        ent.tile.classList.toggle("single", n === 1);
+        ent.tile.classList.toggle("cover", state.fit === "cover");
+        // 单画面/焦点要看主码流；多宫格回子码流。画面不等切换 —— 先在后台
+        // 建新档的播放器，出画后再替换，期间旧画面继续播。
+        upgradeTier(ent, (n === 1) ? "high" : "low");
+        nodes.push(ent.tile);
+      } else {
+        nodes.push(makeTile(c, n === 1));
+      }
+    }
+
+    // 3) 按目标顺序摆放。复用节点用 appendChild 移动（同一文档内的移动不会
+    //    重建播放器）；旧布局里多出来的空白格直接摘掉。
+    Array.prototype.slice.call(grid.children).forEach(function (ch) {
+      if (nodes.indexOf(ch) < 0 && ch.parentNode === grid) grid.removeChild(ch);
+    });
+    nodes.forEach(function (nd) { grid.appendChild(nd); });
 
     if (n === 1) {
       var only = grid.firstChild;
       if (only) only.classList.add("single");
     }
+    $("btnFullscreen").hidden = false;
     refreshSoundBtn();
     if (!liveWatch.timer) liveWatch.timer = setInterval(watchTick, 2000);
+    schedulePrewarm(visible);
   }
 
   // ---- 云台（PTZ）--------------------------------------------------------
@@ -709,6 +861,15 @@
     var tile = el("div", "tile" + (state.fit === "cover" ? " cover" : ""));
     tile.setAttribute("data-cam", cam.id);
 
+    // 播放器条目先登记，attachStream 直接往里填 player —— 以前是反过来
+    // （attachStream 里整体覆盖 tiles[cam.id]），切页面时容易漏掉旧播放器。
+    var entry = {
+      video: null, player: null, tile: tile, cam: cam,
+      tier: (single || state.focusId) ? "high" : "low",
+      parked: false, prewarm: false, destroyed: false
+    };
+    tiles[cam.id] = entry;
+
     var name = el("div", "tile-name");
     var dot = el("i", "dot " + (cam.live && cam.live.alive ? "ok" : "bad"));
     name.appendChild(dot);
@@ -726,12 +887,9 @@
     video.playsInline = true;
     video.alt = cam.name || cam.id;
     // 单画面/焦点看主码流，多宫格用子码流省带宽（没配 url_low 时后端自动回落）
-    var tier = single || state.focusId ? "high" : "low";
-    attachStream(video, tile, cam, tier);
+    entry.video = video;
+    attachStream(video, tile, cam, entry.tier, 0, entry);
     tile.appendChild(video);
-    // 播放器登记在 attachStream 里（连 cam/tier 一起），这里不能再写一遍：
-    // 早先这行把正好的条目覆盖成 player:null，结果切页面时播放器没被销毁，
-    // 服务端订阅一直挂着（ffmpeg 永远不休息），看门狗也找不到这一格。
 
     // 每格单独的声音按钮：两路同时出声会混在一起，所以要能只开这一路
     var snd = el("button", "tile-sound" + (video.muted ? " off" : ""),
@@ -739,7 +897,8 @@
     snd.title = video.muted ? "打开这一路的声音" : "关闭这一路的声音";
     snd.addEventListener("click", function (e) {
       e.stopPropagation();          // 别触发"点画面放大"
-      soundOnly(cam.id, video.muted);
+      // 换档后 video 元素会变，按钮要取当前那一个
+      soundOnly(cam.id, entry.video ? entry.video.muted : true);
     });
     tile.appendChild(snd);
     tile._snd = snd;
@@ -793,17 +952,8 @@
     return tile;
   }
 
-  function attachStream(video, tile, cam, tier, attempt) {
-    attempt = attempt || 0;
-    if (!window.mpegts) {
-      showTileErr(tile, cam, "mpegts.js 未加载");
-      return;
-    }
-    if (!window.mpegts.isSupported()) {
-      showTileErr(tile, cam, "当前浏览器不支持 MSE，请换 Chrome/Edge/Firefox");
-      return;
-    }
-    var player = mpegts.createPlayer({
+  function createLivePlayer(cam, tier) {
+    return mpegts.createPlayer({
       type: "mpegts",        // MPEG-TS 直播流
       isLive: true,
       url: url("live/" + cam.id + ".ts?q=" + (tier === "low" ? "low" : "high"))
@@ -821,11 +971,36 @@
       enableWorker: false,
       autoCleanupSourceBuffer: true
     });
-    tiles[cam.id] = { video: video, player: player, tile: tile, cam: cam, tier: tier };
+  }
+
+  function attachStream(video, tile, cam, tier, attempt, entry) {
+    attempt = attempt || 0;
+    if (!window.mpegts) {
+      showTileErr(tile, cam, "mpegts.js 未加载");
+      return;
+    }
+    if (!window.mpegts.isSupported()) {
+      showTileErr(tile, cam, "当前浏览器不支持 MSE，请换 Chrome/Edge/Firefox");
+      return;
+    }
+    if (entry) destroyShadow(entry);      // 整路重建时，后台换档的临时播放器作废
+    var player = createLivePlayer(cam, tier);
+    if (!entry) {
+      entry = { video: video, player: null, tile: tile, cam: cam,
+                parked: false, prewarm: false, destroyed: false };
+    }
+    entry.video = video;
+    entry.player = player;
+    entry.tile = tile;
+    entry.cam = cam;
+    entry.tier = tier;
+    entry.retryAttempt = attempt;
+    entry.ended = false;
+    tiles[cam.id] = entry;
     player.attachMediaElement(video);
 
     player.on(mpegts.Events.ERROR, function (type, detail) {
-      if (state.view !== "live") return;
+      if (state.view !== "live" || entry.destroyed) return;
       // 把错误类型/细节显示出来，方便定位（以前只显示"拉流失败"，什么都看不出来）
       var msg = "拉流失败，自动重试中…";
       try {
@@ -842,28 +1017,112 @@
       showTileErr(tile, cam, msg);
       // 以前这里只显示"自动重试中…"，其实什么都没重试：解码器一旦被坏时间线
       // 搞死，画面就永久停在那。这里真的重建播放器（指数退避，最长 8 秒一次）。
-      scheduleRetry(video, tile, cam, tier, attempt);
+      scheduleRetry(entry, false);
     });
-    player.on(mpegts.Events.MEDIA_INFO, function (info) {
+    player.on(mpegts.Events.MEDIA_INFO, function () {
       var err = tile.querySelector(".tile-err");
       if (err) err.remove();
+      entry.retryAttempt = 0;             // 这路已经健康，下次异常从 1 秒起步
+      entry.ended = false;
     });
+    // 发布进程重启时服务端会主动收尾这条 HTTP 流：mpegts 不报 ERROR，只发
+    // LOADING_COMPLETE。不处理它，画面就停在最后一帧等看门狗 —— 这正是
+    // "重启后要 6~8 秒才回来"的另一半原因。这里立刻快速重连。
+    if (mpegts.Events.LOADING_COMPLETE) {
+      player.on(mpegts.Events.LOADING_COMPLETE, function () {
+        if (entry.destroyed) return;
+        entry.ended = true;
+        if (state.view !== "live") return;
+        scheduleRetry(entry, true);
+      });
+    }
     player.load();
     video.play().catch(function () {});
   }
 
-  function scheduleRetry(video, tile, cam, tier, attempt) {
-    var delay = Math.min(1000 * Math.pow(2, attempt || 0), 8000);
-    setTimeout(function () {
-      // 视图已切走 / 格子已重建：这次重试作废
-      var cur = tiles[cam.id];
-      if (state.view !== "live" || !tile.isConnected || !cur || cur.tile !== tile) return;
-      try { cur.player.unload(); } catch (e) {}
-      try { cur.player.detachMediaElement(); } catch (e) {}
-      try { cur.player.destroy(); } catch (e) {}
-      delete tiles[cam.id];
-      try { video.removeAttribute("src"); video.load(); } catch (e) {}
-      attachStream(video, tile, cam, tier, (attempt || 0) + 1);
+  /* 切布局时档位（主/子码流）会变。别让画面等新档：旧画面继续播，
+     新档在后台建一个隐藏播放器，等它真的出画（MEDIA_INFO / canplay）
+     再原地替换。用户看到的是"画面没断过，清晰度稍后变化"。 */
+  function upgradeTier(entry, tier) {
+    if (!entry || entry.destroyed || entry.parked || entry.tier === tier) return;
+    var cam = entry.cam;
+    if (!cam) return;
+    // 没配子码流地址：后端的 low/high 本来就是同一路，改标记即可
+    if (!String(cam.url_low || "").trim()) { entry.tier = tier; return; }
+    if (!window.mpegts || !window.mpegts.isSupported()) { entry.tier = tier; return; }
+    destroyShadow(entry);
+    var token = entry.upSeq;
+    var video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    video.style.display = "none";
+    entry.tile.appendChild(video);
+    var player;
+    try { player = createLivePlayer(cam, tier); } catch (e) {
+      if (video.parentNode) video.parentNode.removeChild(video);
+      return;
+    }
+    var sh = { video: video, player: player, timer: null };
+    entry.shadow = sh;
+    var done = false;
+    function commit() {
+      if (done || entry.upSeq !== token || entry.destroyed) return;
+      done = true;
+      clearTimeout(sh.timer);
+      var oldVideo = entry.video, oldPlayer = entry.player;
+      entry.video = video;
+      entry.player = player;
+      entry.tier = tier;
+      entry.shadow = null;
+      video.style.display = "";
+      video.muted = oldVideo ? oldVideo.muted : state.muted;
+      if (oldVideo && oldVideo.parentNode === entry.tile) {
+        entry.tile.insertBefore(video, oldVideo);
+        oldVideo.parentNode.removeChild(oldVideo);
+      } else {
+        entry.tile.appendChild(video);
+      }
+      try { oldPlayer.destroy(); } catch (e) {}
+      try { oldVideo.removeAttribute("src"); oldVideo.load(); } catch (e) {}
+      video.play().catch(function () {});
+      refreshSoundBtn();
+    }
+    function giveUp() {
+      if (done) return;
+      done = true;
+      if (entry.shadow === sh) destroyShadow(entry);
+    }
+    player.attachMediaElement(video);
+    player.on(mpegts.Events.MEDIA_INFO, commit);
+    player.on(mpegts.Events.ERROR, giveUp);
+    video.addEventListener("canplay", commit);
+    // 12 秒还没建好就不换了：旧档继续看，总比黑屏强
+    sh.timer = setTimeout(giveUp, 12000);
+    player.load();
+    video.play().catch(function () {});
+  }
+
+  function scheduleRetry(entry, fast) {
+    if (!entry || entry.destroyed) return;
+    var cam = entry.cam, tile = entry.tile;
+    if (!cam || !tile) return;
+    var attempt = fast ? 1 : (entry.retryAttempt || 0) + 1;
+    var delay = fast ? 350 : Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+    clearTimeout(entry.retryTimer);
+    entry.retryTimer = setTimeout(function () {
+      // 视图已切走 / 进了停车场 / 这一格已被替换：这次重试作废
+      if (entry.destroyed || entry.parked || state.view !== "live") return;
+      if (!tile.isConnected || tiles[cam.id] !== entry) return;
+      var p = entry.player, v = entry.video;
+      if (p) {
+        try { p.unload(); } catch (e) {}
+        try { p.detachMediaElement(); } catch (e) {}
+        try { p.destroy(); } catch (e) {}
+        entry.player = null;
+      }
+      if (v) { try { v.removeAttribute("src"); v.load(); } catch (e) {} }
+      attachStream(v || tile.querySelector("video"), tile, cam, entry.tier, attempt, entry);
     }, delay);
   }
 
@@ -884,7 +1143,7 @@
      多路画面各自有喇叭：只开其中一路，避免两个房间的声音混在一起。 */
   function tileVideo(k) {
     var t = tiles[k];
-    if (!t) return null;
+    if (!t || t.parked) return null;    // 停车场里的不算"正在看的这一路"
     return t.video || (t.tile && t.tile.querySelector("video")) || null;
   }
 
@@ -898,7 +1157,7 @@
     if (b) b.textContent = state.muted ? "🔇 静音" : "🔊 有声";
     Object.keys(tiles).forEach(function (k) {
       var t = tiles[k];
-      if (!t.tile || !t.tile._snd) return;
+      if (!t || t.parked || !t.tile || !t.tile._snd) return;
       var v = tileVideo(k);
       var off = !v || v.muted;
       t.tile._snd.textContent = off ? "🔇" : "🔊";
@@ -1107,6 +1366,13 @@
         box.appendChild(b);
       });
       if (!state.play.day || days.indexOf(state.play.day) < 0) {
+        // 通知/检索深链指定的那一天优先
+        var pend = state.play.pending;
+        if (pend && String(pend.cam) === String(camId) &&
+            days.indexOf(pend.day) >= 0 && state.play.day !== pend.day) {
+          pickDay(pend.day);
+          return;
+        }
         pickDay(days[0]);
       } else {
         pickDay(state.play.day, true);
@@ -1150,6 +1416,7 @@
           $("playerTip").textContent =
             "今天共 " + state.play.segs.length + " 段录像（点时间轴任意位置回看）";
         }
+        runPendingJump();
       }).catch(function (e) { toast(e.message, "err"); });
   }
 
@@ -1288,6 +1555,7 @@
       });
       playPlayer.load();
       v.muted = false;
+      applySpeed(v);
       v.play().catch(function () {
         v.muted = true;
         v.play().catch(function () {});
@@ -1305,6 +1573,7 @@
                 "?start=" + Math.floor(state.play.offsetBase) +
                 "&dur=" + Math.ceil(Math.max(1, segLen - state.play.offsetBase)));
     v.muted = false;
+    applySpeed(v);
     v.play().catch(function () {
       v.muted = true;
       v.play().catch(function () {});
@@ -1352,19 +1621,25 @@
       var nm = el("div", "ci-name");
       nm.appendChild(el("span", null, cam.name || cam.id));
       if (cam.record) nm.appendChild(el("span", "tag rec", "录像"));
+      if (cam.masked) nm.appendChild(el("span", "tag mask", "遮蔽 " + (cam.privacy || "").replace(/ .*/, "")));
       if (!cam.enabled) nm.appendChild(el("span", "tag off", "已停用"));
       main.appendChild(nm);
       main.appendChild(el("div", "ci-url", cam.url_masked || ""));
+      if (cam.privacy) main.appendChild(el("div", "ci-url", cam.privacy));
       item.appendChild(main);
 
       var acts = el("div", "ci-acts");
       var bSnap = el("button", "btn small", "截图");
       bSnap.addEventListener("click", function () { openSnapshot(cam); });
-      var bEdit = el("button", "btn small", "编辑");
-      bEdit.addEventListener("click", function () { openCamModal(cam); });
-      var bDel = el("button", "btn small danger", "删除");
-      bDel.addEventListener("click", function () { delCam(cam); });
-      acts.appendChild(bSnap); acts.appendChild(bEdit); acts.appendChild(bDel);
+      acts.appendChild(bSnap);
+      // 只有管理员能改这路摄像头；只读账号点了后端也是 403，直接不画出来
+      if (isAdmin()) {
+        var bEdit = el("button", "btn small", "编辑");
+        bEdit.addEventListener("click", function () { openCamModal(cam); });
+        var bDel = el("button", "btn small danger", "删除");
+        bDel.addEventListener("click", function () { delCam(cam); });
+        acts.appendChild(bEdit); acts.appendChild(bDel);
+      }
       item.appendChild(acts);
       box.appendChild(item);
     });
@@ -1750,6 +2025,8 @@
     sc("setLiveAudio", lv.audio !== false);
     renderLiveVideoMode();
     renderTalkDiag();
+
+    fillGroupSettings();
 
     $("aboutVer").textContent = "version " + state.version;
   }
@@ -2159,6 +2436,32 @@
         stale_seconds: Math.max(90, gn("setWdStale", 180)),
         repair_cooldown: Math.max(60, gn("setWdCooldown", 900)),
         max_attempts: Math.min(10, Math.max(1, gn("setWdMaxTries", 3)))
+      },
+      ai: {
+        enabled: gc("setAiOn"),
+        audio_events: gc("setAudioEv"),
+        audio_threshold: Math.min(20, Math.max(1.2, gf("setAudioThr", 2.5))),
+        objects: gc("setObjects"),
+        model_path: gv("setModelPath").trim(),
+        labels: gv("setLabels").trim(),
+        input_size: Math.min(1280, Math.max(160, gn("setInputSize", 640))),
+        obj_confidence: Math.min(0.95, Math.max(0.05, gf("setObjConf", 0.35))),
+        vlm_enabled: gc("setVlmOn"),
+        vlm_url: gv("setVlmUrl").trim(),
+        vlm_model: gv("setVlmModel").trim()
+      },
+      integrity: {
+        enabled: gc("setIgOn"),
+        days: Math.min(62, Math.max(1, gn("setIgDays", 7))),
+        gap_tolerance: Math.min(6, Math.max(1, gf("setIgTol", 1.5)))
+      },
+      archive: {
+        enabled: gc("setArOn"),
+        remote: gv("setArRemote").trim(),
+        older_days: Math.min(3650, Math.max(1, gn("setArDays", 30))),
+        delete_local: gc("setArDel"),
+        auto: gc("setArAuto"),
+        auto_hour: Math.min(23, Math.max(0, gn("setArHour", 4)))
       }
     };
     // 密码留空 = 不修改，后端也按这个语义处理
@@ -2166,6 +2469,7 @@
     if (!body.notify.ding_secret) delete body.notify.ding_secret;
     if (!body.ptz.token) delete body.ptz.token;
     if (!body.ptz.g2r_pass) delete body.ptz.g2r_pass;
+    if (!gv("setVlmKey").trim()) delete body.ai.vlm_key;
 
     api("api/settings", { method: "PUT", body: body }).then(function (j) {
       // notes 是后端钳过的清单：改了什么要当场说，不能让用户下次打开
@@ -2243,11 +2547,18 @@
     $("camName").value = cam ? (cam.name || "") : "";
     $("camUrl").value = cam ? (cam.url || "") : "";
     $("camUrlLow").value = cam ? (cam.url_low || "") : "";
+    // 列表接口只给掩码地址，要核对原文再单独取（仅管理员，且进审计）
+    var rv = $("btnRevealUrl"), rh = $("urlSecretHint");
+    var showRev = !!(cam && cam.url_secret);
+    if (rv) rv.hidden = !showRev;
+    if (rh) rh.hidden = !showRev;
+    if (rv && showRev) rv.textContent = "显示完整地址";
     $("camDid").value = cam ? (cam.did || "") : "";
     $("camTransport").value = cam ? (cam.transport || "tcp") : "tcp";
     $("camQuality").value = cam ? ((cam.quality || "HIGH").toUpperCase()) : "HIGH";
     $("camRecord").checked = cam ? !!cam.record : true;
     $("camEnabled").checked = cam ? !!cam.enabled : true;
+    openMaskEditor(cam);
     hint("camTestHint", "填好后可以先点「测试连接」确认能出流。");
     $("camModal").hidden = false;
     // 编辑摄像头直接进表单；新增则先进类型选择
@@ -2361,6 +2672,21 @@
       });
   });
 
+  $("btnRevealUrl").addEventListener("click", function () {
+    if (!editing) return;
+    var btn = this;
+    btn.disabled = true;
+    api("api/cameras/" + editing.id + "/secret")
+      .then(function (j) {
+        $("camUrl").value = j.url || "";
+        if (j.url_low) $("camUrlLow").value = j.url_low;
+        btn.hidden = true;
+        hint("camTestHint", "完整地址已填入，改完记得保存。");
+      })
+      .catch(function (e) { toast(e.message, "err"); })
+      .then(function () { btn.disabled = false; });
+  });
+
   $("btnCamSave").addEventListener("click", function () {
     var body = {
       name: $("camName").value.trim() || "未命名",
@@ -2397,6 +2723,8 @@
         body.onvif_host = opt.dataset.host || "";
       }
     }
+    // 遮蔽区域总是提交（空数组 = 清空）：后端 sanitize 过才落盘
+    body.privacy = { masks: state.masks || [] };
     var p = editing
       ? api("api/cameras/" + editing.id, { method: "PUT", body: body })
       : api("api/cameras", { method: "POST", body: body });
@@ -2686,6 +3014,8 @@
       state.storage = j.storage || null;
       state.version = j.version || "";
       state.ptz = j.ptz || { available: false, reason: "" };
+      state.auth = j.auth || state.auth;
+      applyRole();
       var recN = state.cams.filter(function (c) { return c.rec && c.rec.running; }).length;
       var chip = $("chipRec");
       var txt = chip.querySelector("span");
@@ -2751,8 +3081,7 @@
     if (xmPollTimer) { clearInterval(xmPollTimer); xmPollTimer = null; }
   }
 
-  var btnXm = $("btnAddXiaomi");
-  if (btnXm) btnXm.addEventListener("click", openXmModal);
+  // 打开扫码弹窗的唯一入口是「添加摄像头 → 小米摄像头」类型卡（见 camTypeGrid）
   $("xmModalClose").addEventListener("click", closeXmModal);
   $("btnXmCancel").addEventListener("click", closeXmModal);
   $("xmModal").addEventListener("click", function (e) {
@@ -2932,6 +3261,8 @@
   // 标题从卡片自己的 h3 派生，不再维护第二份清单：加一张卡片不会漏一个导航项。
   // 滚动容器是 .set-main（它 position:relative，所以 card.offsetTop 就是
   // 「滚动到这儿」的目标值，不用换算 offsetParent 链）。
+  var setNavMark = function () {}, setNavWired = false, setNavRaf = 0;
+
   function buildSettingsNav() {
     var main = $("setMain"), nav = $("setNav");
     if (!main || !nav) return;
@@ -2958,14 +3289,933 @@
       cards.forEach(function (card, i) { if (card.offsetTop <= y) best = i; });
       items.forEach(function (b, i) { b.classList.toggle("on", i === best); });
     }
-    var raf = 0;
-    main.addEventListener("scroll", function () {
-      if (raf) return;
-      raf = requestAnimationFrame(function () { raf = 0; mark(); });
-    });
+    // 角色切换会重建导航：滚动监听只挂一次，但指向最新那份 mark，
+    // 否则高亮会停在旧卡片列表上（那些节点已经被 innerHTML 清掉了）
+    setNavMark = mark;
+    if (!setNavWired) {
+      setNavWired = true;
+      main.addEventListener("scroll", function () {
+        if (setNavRaf) return;
+        setNavRaf = requestAnimationFrame(function () {
+          setNavRaf = 0;
+          setNavMark();
+        });
+      });
+    }
     state.markSetNav = mark;   // 视图隐藏时 offsetTop 全是 0，切进设置页要重算一次
     mark();
   }
+
+  /* ============================================================ 1.3 新增 */
+  /* 这一节的接口都按「后端已经判过权限」来写：403/401 一律当错误提示出来，
+     前端隐藏按钮只是省事，不是安全边界（安全边界在数据出口）。 */
+
+  /* ------------------------------------------------------------ 角色 */
+  function isAdmin() {
+    return !!(state.auth || {}).admin;
+  }
+
+  // 只读账号能看的设置卡片；其余整块不画（表单里也不会有他能改的值）
+  var READ_KEEP_CARDS = ["摄像机", "链路健康", "关于", "通知与安装"];
+
+  function applyRole() {
+    var a = state.auth || {};
+    var admin = !!a.admin;
+    var chip = $("chipUser");
+    if (chip) {
+      if (!a.logged_in) {
+        chip.hidden = true;
+      } else {
+        chip.hidden = false;
+        chip.textContent = (a.username || "已登录") +
+          (admin ? "（管理员）" : "（只读）");
+        chip.className = "chip" + (admin ? "" : " chip-ro");
+        chip.title = "登录名：" + (a.username || "") +
+          ((a.cams || []).length ? ("；授权摄像头：" + a.cams.join("、"))
+                                 : (admin ? "；可看全部摄像头" : "；未授权任何摄像头"));
+      }
+    }
+    Array.prototype.forEach.call(
+      document.querySelectorAll("#setMain .cards > .card"), function (c) {
+        var h = c.querySelector("h3");
+        var label = String((h && (h.firstChild || {}).nodeValue) ||
+                           (h ? h.textContent : "") || "").trim();
+        c.style.display = (!admin && READ_KEEP_CARDS.indexOf(label) < 0) ? "none" : "";
+      });
+    if (!admin) {
+      var notice = $("readOnlyNotice");
+      if (!notice) {
+        var main = $("setMain");
+        notice = el("p", "hint readonly-notice",
+          "当前是只读账号：设置项由管理员维护。这里只列出画面、链路与关于；" +
+          "被授权之外的摄像头即使在地址栏里手工拼出来也拿不到画面。");
+        // 必须带上 id：这段文案在每次 /api/state 回调里都会被检查，没有 id
+        // 就等于每次刷新都往前插一条（刷新是 8 秒一轮）。
+        notice.id = "readOnlyNotice";
+        if (main) main.insertBefore(notice, main.firstChild);
+      }
+    } else {
+      var n2 = $("readOnlyNotice");
+      if (n2) n2.parentNode.removeChild(n2);
+    }
+    if (String(admin) !== String(state.roleSig)) {
+      state.roleSig = admin;
+      buildSettingsNav();
+    }
+    // 导出与分享、用户管理这些按钮只对管理员存在
+    ["btnExportSeg", "btnIgScan", "btnIgDeep", "btnArRun", "btnArCancel",
+     "btnUserAdd", "btnSharesRefresh", "btnAuditGo"].forEach(function (id) {
+      var n = $(id);
+      if (n) n.hidden = !admin;
+    });
+  }
+
+  /* ------------------------------------------------------------ 倍速 */
+  function applySpeed(v) {
+    if (!v) return;
+    try { v.playbackRate = state.speed || 1; } catch (e) {}
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll("#speedPick button"), function (b) {
+    b.addEventListener("click", function () {
+      state.speed = parseFloat(b.getAttribute("data-rate")) || 1;
+      try { localStorage.setItem("nw.speed", String(state.speed)); } catch (e) {}
+      Array.prototype.forEach.call(document.querySelectorAll("#speedPick button"), function (x) {
+        x.classList.toggle("on", x === b);
+      });
+      applySpeed($("player"));
+      // 倍速时浏览器会把声音静音（>4× 是 Chrome 的硬规则），别说用户在"丢音"
+      toast(state.speed > 1
+        ? ("倍速回放 " + state.speed + "×（高倍速下浏览器会自动静音）")
+        : "恢复正常速度", "ok");
+    });
+  });
+
+  /* ------------------------------------------------------------ 隐私遮蔽编辑器 */
+  function openMaskEditor(cam) {
+    state.masks = (cam && cam.masks ? cam.masks : []).map(function (m) {
+      return { x: m.x, y: m.y, w: m.w, h: m.h };
+    });
+    var shot = $("maskShot");
+    if (shot) shot.removeAttribute("src");
+    var bShot = $("btnMaskShot");
+    if (bShot) {
+      bShot.disabled = !cam;      // 新加的摄像头还没有 id，取不到帧
+      bShot.textContent = cam ? "取一帧当底图" : "保存后可编辑并取帧";
+    }
+    var hintN = $("maskHint");
+    if (hintN) {
+      hintN.textContent = cam
+        ? ("这台摄像头：" + (cam.privacy || "未启用") +
+           "。最多 8 块；保存后这一路的实时与录像会重建（遮蔽烧进像素，必须重编码）。")
+        : "新加的摄像头先保存，再回来编辑就能取一帧当底图对着画。最多 8 块，遮蔽会烧进实时画面与录像。";
+    }
+    renderMasks();
+  }
+
+  function renderMasks() {
+    var box = $("maskShapes"), list = $("maskList");
+    if (box) box.innerHTML = "";
+    if (list) list.innerHTML = "";
+    (state.masks || []).forEach(function (m, i) {
+      if (box) {
+        var s = el("div", "mask-shape");
+        s.style.left = (m.x * 100) + "%";
+        s.style.top = (m.y * 100) + "%";
+        s.style.width = (m.w * 100) + "%";
+        s.style.height = (m.h * 100) + "%";
+        box.appendChild(s);
+      }
+      if (list) {
+        var row = el("div", "mask-row");
+        row.appendChild(el("span", "mono",
+          "#" + (i + 1) + "  x " + (m.x * 100).toFixed(1) + "%  y " + (m.y * 100).toFixed(1) +
+          "%  " + (m.w * 100).toFixed(1) + "×" + (m.h * 100).toFixed(1) + "%"));
+        var b = el("button", "btn small danger", "删");
+        b.addEventListener("click", function () {
+          state.masks.splice(i, 1);
+          renderMasks();
+        });
+        row.appendChild(b);
+        list.appendChild(row);
+      }
+    });
+    var tip = $("maskTip");
+    if (tip) tip.hidden = (state.masks || []).length > 0;
+  }
+
+  (function bindMaskStage() {
+    var stage = $("maskStage");
+    if (!stage) return;
+    var drawing = null;
+    function pos(ev) {
+      var r = stage.getBoundingClientRect();
+      var cx = (ev.touches && ev.touches[0] ? ev.touches[0].clientX : ev.clientX);
+      var cy = (ev.touches && ev.touches[0] ? ev.touches[0].clientY : ev.clientY);
+      return {
+        x: Math.min(1, Math.max(0, (cx - r.left) / r.width)),
+        y: Math.min(1, Math.max(0, (cy - r.top) / r.height))
+      };
+    }
+    function down(ev) {
+      if ((state.masks || []).length >= 8) { toast("最多 8 块遮蔽区域", "err"); return; }
+      drawing = pos(ev);
+      ev.preventDefault();
+    }
+    function move(ev) {
+      if (!drawing) return;
+      var p = pos(ev);
+      var ghost = stage.querySelector(".mask-ghost");
+      if (!ghost) { ghost = el("div", "mask-shape mask-ghost"); stage.appendChild(ghost); }
+      ghost.style.left = (Math.min(drawing.x, p.x) * 100) + "%";
+      ghost.style.top = (Math.min(drawing.y, p.y) * 100) + "%";
+      ghost.style.width = (Math.abs(p.x - drawing.x) * 100) + "%";
+      ghost.style.height = (Math.abs(p.y - drawing.y) * 100) + "%";
+      ev.preventDefault();
+    }
+    function up(ev) {
+      if (!drawing) return;
+      var p = pos(ev);
+      var g = stage.querySelector(".mask-ghost");
+      if (g) g.parentNode.removeChild(g);
+      var m = {
+        x: Math.min(drawing.x, p.x), y: Math.min(drawing.y, p.y),
+        w: Math.abs(p.x - drawing.x), h: Math.abs(p.y - drawing.y)
+      };
+      drawing = null;
+      // 随手点一下（不到 1% 见方）不算画区域：那多半是想看画面
+      if (m.w < 0.02 || m.h < 0.02) { toast("框太小，没记进去（按住拖动才画一块区域）", "warn"); return; }
+      state.masks.push(m);
+      renderMasks();
+    }
+    stage.addEventListener("mousedown", down);
+    stage.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", function (e) { if (drawing) up(e); });
+    stage.addEventListener("touchstart", down, { passive: false });
+    stage.addEventListener("touchmove", move, { passive: false });
+    stage.addEventListener("touchend", function (e) {
+      if (!drawing) return;
+      var t = (e.changedTouches || [])[0] || {};
+      up({ clientX: t.clientX, clientY: t.clientY });
+    });
+    var bClear = $("btnMaskClear");
+    if (bClear) bClear.addEventListener("click", function () {
+      state.masks = [];
+      renderMasks();
+      toast("已清空（保存后才生效）", "ok");
+    });
+    var bShot = $("btnMaskShot");
+    if (bShot) bShot.addEventListener("click", function () {
+      var shot = $("maskShot");
+      if (shot && editing) {
+        shot.src = url("api/cameras/" + encodeURIComponent(editing.id) +
+                       "/snapshot?t=" + Date.now());
+      }
+    });
+  })();
+
+  /* ------------------------------------------------------------ AI 状态与检索 */
+  function loadAiState() {
+    var n = $("aiState");
+    if (!n) return;
+    api("api/ai/status").then(function (j) {
+      var a = j.ai || {};
+      var obj = a.objects || {}, aud = a.audio || {}, vlm = a.vlm || {};
+      var bits = [];
+      bits.push("总开关：" + (a.enabled ? "开" : "关（下面这些都不会跑）"));
+      bits.push("声响事件：" + (aud.enabled
+        ? ("开，阈值 " + aud.threshold + (aud.error ? "（出错：" + aud.error + "）" : ""))
+        : "关"));
+      bits.push("对象识别：" + (obj.enabled
+        ? (obj.available ? ("可用（" + obj.model + "）") : ("不可用：" + (obj.deps || obj.model)))
+        : "关（" + obj.model + "）"));
+      bits.push("VLM 描述：" + (vlm.enabled
+        ? (vlm.configured ? ("开，" + (vlm.model || "默认模型") +
+                              (vlm.last_error ? "；上次出错：" + vlm.last_error : ""))
+                          : "开了但没填服务地址")
+        : "关"));
+      if (a.last) bits.push("最近一轮：" + JSON.stringify(a.last).slice(0, 120));
+      n.textContent = "状态：" + bits.join(" ｜ ");
+      n.className = "hint" + (a.enabled && (aud.error || !obj.available) ? " warn" : "");
+    }).catch(function (e) {
+      n.textContent = "状态：读不到（" + e.message + "）";
+    });
+  }
+
+  function fmtLabels(it) {
+    var kinds = { motion: "移动", audio: "声响", object: "对象" };
+    var head = kinds[it.kind] || it.kind || "事件";
+    var ls = (it.labels || []).join("、");
+    return ls ? (head + "·" + ls) : head;
+  }
+
+  function runAiSearch() {
+    var q = (gv("aiQuery") || "").trim();
+    var box = $("aiResults");
+    if (!q) { toast("先输入想查的内容", "err"); return; }
+    if (box) { box.hidden = false; box.innerHTML = ""; box.appendChild(el("p", "hint", "检索中…")); }
+    api("api/ai/search", { method: "POST", body: { q: q }, timeout: 40000 })
+      .then(function (j) {
+        var items = j.items || [];
+        var win = fmtTime(j.from) + " ~ " + fmtTime(j.to);
+        if (box) {
+          box.innerHTML = "";
+          var head = el("p", "hint");
+          head.innerHTML = "按 <b>" + escHtml(win) + "</b> 这段时间找，命中 " +
+            (j.total || 0) + " 条（列出 " + items.length + " 条）" +
+            (j.assumed ? "；没说时间，默认按最近 24 小时" : "") +
+            ((j.keywords || []).length ? "；关键词：" + escHtml(j.keywords.join("、")) : "");
+          box.appendChild(head);
+        }
+        if (!items.length) {
+          if (box) box.appendChild(el("p", "hint", "没有匹配的事件。可以先只说时间（例如「今天下午」），或确认「本地 AI 检测」与事件侦测是否开着。"));
+          return;
+        }
+        items.slice(0, 60).forEach(function (it) {
+          var row = el("div", "ai-hit");
+          var d = new Date(it.t0 * 1000);
+          var t = el("span", "mono", ymd(d) + " " + hhmmss(it.t0));
+          row.appendChild(t);
+          row.appendChild(el("span", "tag ev", fmtLabels(it)));
+          row.appendChild(el("span", null, it.name || it.cam));
+          if (it.desc) row.appendChild(el("span", "ai-desc", it.desc));
+          var b = el("button", "btn small", "看回放");
+          b.addEventListener("click", function () { gotoEventTs(it.cam, it.t0); });
+          row.appendChild(b);
+          if (box) box.appendChild(row);
+        });
+      }).catch(function (e) {
+        if (box) { box.hidden = false; box.innerHTML = ""; box.appendChild(el("p", "hint bad", e.message)); }
+      });
+  }
+
+  function escHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  $("btnAiSearch").addEventListener("click", runAiSearch);
+  $("aiQuery").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") runAiSearch();
+  });
+
+  /* ------------------------------------------------------------ 通知深链 */
+  function gotoEventTs(camId, ts) {
+    var day = ymd(new Date(ts * 1000));
+    state.play.auto = false;
+    state.play.pending = { cam: String(camId), day: day, ts: ts };
+    if (String(state.play.cam) === String(camId) && state.play.day === day) {
+      setView("play");
+      runPendingJump();
+      return;
+    }
+    setView("play");
+    var sel = $("playCam");
+    if (sel) {
+      sel.value = String(camId);
+      state.play.cam = String(camId);
+    }
+    state.play.day = null;
+    loadDays(String(camId));
+  }
+
+  function runPendingJump() {
+    var p = state.play.pending;
+    if (!p) return;
+    if (String(state.play.cam) !== p.cam || state.play.day !== p.day) return;
+    state.play.pending = null;
+    if (!state.play.segs.length) { toast("那一刻没有录像", "err"); return; }
+    jumpTo(p.ts);
+    $("playerTip").textContent = "已跳到 " + hhmmss(p.ts) + "（深链：通知或检索点进来的）";
+  }
+
+  function applyHashJump() {
+    var m = /#event=([^@&]+)@(\d+)/.exec(location.hash || "");
+    if (!m) return false;
+    gotoEventTs(decodeURIComponent(m[1]), parseInt(m[2], 10) || 0);
+    return true;
+  }
+
+  /* ------------------------------------------------------------ 完整性自检 */
+  function loadIntegrity() {
+    var box = $("integrityBox");
+    if (!box || !isAdmin()) return;
+    api("api/integrity").then(function (j) {
+      renderIntegrity(j.integrity || {}, box);
+    }).catch(function (e) {
+      box.textContent = "读不到自检结果：" + e.message;
+    });
+  }
+
+  function renderIntegrity(ig, box) {
+    box.innerHTML = "";
+    if (ig.running) { box.appendChild(el("p", "hint", "正在自检（逐段读时长，可能要一两分钟）…")); return; }
+    var r = ig.result || {};
+    if (!r.cams) {
+      box.appendChild(el("p", "hint", "还没有自检过。点下面的「立即自检」跑一轮。"));
+      return;
+    }
+    var head = el("p", "hint");
+    head.innerHTML = "自检时间 <b>" + escHtml(r.at_text || "—") + "</b> ｜ 往回 " +
+      (r.days || 0) + " 天 ｜ 分段 " + (r.segment_minutes || 0) + " 分钟 ｜ 共 " +
+      (r.segments_total || 0) + " 段 / " + fmtBytes(r.bytes_total || 0) +
+      " ｜ 空洞 <b>" + (r.gaps_total || 0) + "</b> ｜ 坏段 <b>" + (r.bad_total || 0) + "</b>";
+    box.appendChild(head);
+    (r.cams || []).forEach(function (c) {
+      var row = el("div", "ig-row");
+      row.appendChild(el("span", null, c.name || c.cam));
+      row.appendChild(el("span", "mono",
+        (c.hours || 0).toFixed(1) + "h · " + c.segments + " 段 · 空白天 " + c.empty_days));
+      var n = (c.gaps || []).length + (c.bad || []).length;
+      row.appendChild(el("span", "badge state-" + (n ? "broken" : "ok"), n ? (n + " 处要看") : "无异常"));
+      box.appendChild(row);
+      (c.gaps || []).slice(0, 8).forEach(function (g) {
+        box.appendChild(el("div", "ig-gap mono",
+          "  少 " + Math.round(g.seconds / 60) + " 分钟，在 " + hhmmss(g.from) +
+          " 之后（" + (g.after || "") + "）"));
+      });
+      (c.bad || []).slice(0, 8).forEach(function (b) {
+        box.appendChild(el("div", "ig-gap mono", "  坏段 " + (b.file || "") + "：" + (b.why || "")));
+      });
+    });
+  }
+
+  $("btnIgScan").addEventListener("click", function () { startIntegrityScan(false); });
+  $("btnIgDeep").addEventListener("click", function () { startIntegrityScan(true); });
+
+  function startIntegrityScan(deep) {
+    var b = $(deep ? "btnIgDeep" : "btnIgScan");
+    var old = b.textContent;
+    b.disabled = true; b.textContent = "自检中…";
+    api("api/integrity/scan", { method: "POST", body: { deep: !!deep }, timeout: 120000 })
+      .then(function (j) {
+        renderIntegrity({ result: j, running: false }, $("integrityBox"));
+        toast("自检完成：空洞 " + (j.gaps_total || 0) + " 处、坏段 " + (j.bad_total || 0) + " 个",
+              (j.gaps_total || j.bad_total) ? "warn" : "ok");
+      }).catch(function (e) { toast(e.message, "err"); })
+      .then(function () { b.disabled = false; b.textContent = old; });
+  }
+
+  /* ------------------------------------------------------------ 冷层归档 */
+  function loadArchive() {
+    var box = $("archiveBox");
+    if (!box || !isAdmin()) return;
+    api("api/archive").then(function (j) {
+      var a = j.archive || {};
+      box.innerHTML = "";
+      var head = el("p", "hint");
+      head.innerHTML = a.available
+        ? ("rclone：<b>" + escHtml(a.binary || "") + "</b> ｜ 远端 " +
+           escHtml((a.config || {}).remote || "未填") + " ｜ 搬 " +
+           ((a.config || {}).older_days || 30) + " 天前的段 ｜ " +
+           ((a.config || {}).delete_local ? "核对后删本地" : "只复制不删"))
+        : "找不到 rclone 二进制 —— <b>归档跑不起来</b>。容器里得放一份 rclone（或用 HE_RCLONE 指路径）。";
+      box.appendChild(head);
+      if (a.running) box.appendChild(el("p", "hint", "正在搬：" + (a.progress || "…")));
+      if (a.error) box.appendChild(el("p", "hint bad", "出错：" + a.error));
+      if (a.last) box.appendChild(el("p", "hint mono",
+        "上一轮：" + fmtTime(a.at) + " ｜ 复制 " + (a.last.copied || 0) +
+        " 个 / 失败 " + (a.last.failed || 0) + " 个 / 删除 " + (a.last.deleted || 0) +
+        " 个 / " + fmtBytes(a.last.bytes || 0)));
+    }).catch(function (e) { box.textContent = "读不到归档状态：" + e.message; });
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return "—";
+    var d = new Date(ts * 1000);
+    return ymd(d) + " " + hhmmss(ts);
+  }
+
+  $("btnArRun").addEventListener("click", function () {
+    var b = $("btnArRun"), old = b.textContent;
+    b.disabled = true; b.textContent = "已启动…";
+    api("api/archive/run", { method: "POST", body: {} })
+      .then(function (j) {
+        toast(j.started ? "归档已在后台跑（进度在这里刷新看）"
+                        : ("没启动：" + (j.error || "条件不满足")), j.started ? "ok" : "err");
+        return loadArchive();
+      }).catch(function (e) { toast(e.message, "err"); })
+      .then(function () { b.disabled = false; b.textContent = old; });
+  });
+
+  $("btnArCancel").addEventListener("click", function () {
+    api("api/archive/cancel", { method: "POST" })
+      .then(function () { toast("已请求停止（当前这个文件搬完就停）", "ok"); loadArchive(); })
+      .catch(function (e) { toast(e.message, "err"); });
+  });
+
+  /* ------------------------------------------------------------ 导出与分享 */
+  var exportTimer = null;
+
+  $("btnExportSeg").addEventListener("click", function () {
+    var p = $("exportPanel");
+    if (!p) return;
+    p.hidden = !p.hidden;
+    if (!p.hidden) {
+      var base = state.play.playhead || Math.floor(Date.now() / 1000);
+      $("expFrom").value = toLocalInput(base - 300);
+      $("expTo").value = toLocalInput(base + 300);
+      $("expNote").placeholder = "摄像头：" + ((state.cams.filter(function (c) {
+        return String(c.id) === String(state.play.cam); })[0] || {}).name || state.play.cam || "");
+    }
+  });
+  $("btnExportClose").addEventListener("click", function () { $("exportPanel").hidden = true; });
+
+  function toLocalInput(ts) {
+    var d = new Date(ts * 1000);
+    return ymd(d) + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+  function fromLocalInput(v, fallback) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(v || ""));
+    if (!m) return fallback;
+    return Math.floor(new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime() / 1000);
+  }
+
+  $("btnExportGo").addEventListener("click", function () {
+    var st = $("exportState");
+    var from = fromLocalInput($("expFrom").value, 0);
+    var to = fromLocalInput($("expTo").value, 0);
+    if (!from || !to || to <= from) { toast("时间范围不合法", "err"); return; }
+    var b = $("btnExportGo");
+    b.disabled = true;
+    api("api/export", {
+      method: "POST",
+      body: { cam: state.play.cam, from: from, to: to,
+              mask: gc("expMask"), note: gv("expNote").trim() }
+    }).then(function (j) {
+      var job = j.job || {};
+      if (st) st.textContent = "导出任务 " + job.id + " 已建立，正在转码…";
+      pollExport(job.id);
+      loadExports();
+    }).catch(function (e) {
+      if (st) st.textContent = "导出失败：" + e.message;
+      toast(e.message, "err");
+      b.disabled = false;
+    });
+  });
+
+  function pollExport(jid) {
+    if (exportTimer) clearInterval(exportTimer);
+    var b = $("btnExportGo");
+    var n = 0;
+    exportTimer = setInterval(function () {
+      n++;
+      api("api/export/" + jid).then(function (j) {
+        var job = j.job || {};
+        var st = $("exportState");
+        if (st) {
+          st.textContent = job.state === "running"
+            ? ("导出中 " + (job.pct || 0) + "%（" + (job.segments || 0) + " 段）")
+            : (job.state === "done"
+               ? ("完成：" + fmtBytes(job.bytes || 0) + "，可以下载或生成分享链接（列表在设置页「导出与分享」）")
+               : ("失败：" + (job.error || "未知原因")));
+        }
+        if (job.state !== "running") {
+          clearInterval(exportTimer); exportTimer = null; b.disabled = false;
+          loadExports();
+        }
+      }).catch(function (e) {
+        clearInterval(exportTimer); exportTimer = null; b.disabled = false;
+        if ($("exportState")) $("exportState").textContent = "读不到进度：" + e.message;
+      });
+      if (n > 600) { clearInterval(exportTimer); exportTimer = null; }
+    }, 2000);
+  }
+
+  function loadExports() {
+    var box = $("exportList");
+    if (!box || !isAdmin()) return;
+    api("api/export").then(function (j) {
+      var jobs = j.jobs || [];
+      box.innerHTML = "";
+      if (!jobs.length) { box.appendChild(el("p", "hint", "还没有导出任务。")); return; }
+      jobs.forEach(function (job) {
+        var row = el("div", "list-row");
+        row.appendChild(el("span", "mono", fmtTime(job.created)));
+        row.appendChild(el("span", null, (job.name || job.cam) + " " +
+                               hhmmss(job.from) + "–" + hhmmss(job.to)));
+        row.appendChild(el("span", "tag", job.mask ? "已打码" : "原片"));
+        row.appendChild(el("span", "badge state-" +
+                                 (job.state === "done" ? "ok" : job.state === "running" ? "idle" : "broken"),
+                           job.state === "running" ? (job.pct || 0) + "%" :
+                           (job.state === "done" ? fmtBytes(job.bytes || 0) : "失败")));
+        if (job.state === "done") {
+          var d = el("a", "btn small", "下载");
+          d.href = url("export/" + job.id + "/file.mp4");
+          d.target = "_blank";
+          row.appendChild(d);
+          var s = el("button", "btn small", "生成分享链接");
+          s.addEventListener("click", function () { shareJob(job.id); });
+          row.appendChild(s);
+        }
+        if (job.note) row.appendChild(el("span", "ai-desc", job.note));
+        box.appendChild(row);
+      });
+    }).catch(function (e) { box.textContent = "读不到导出列表：" + e.message; });
+  }
+
+  function shareJob(jid) {
+    var hours = prompt("这条链接几小时之后自动失效？（最长 168 小时）", "24");
+    if (hours === null) return;
+    api("api/export/" + jid + "/share", { method: "POST", body: { hours: parseFloat(hours) || 24 } })
+      .then(function (j) {
+        var s = j.share || {};
+        if (s.url) {
+          copyText(s.url);
+          toast("链接已生成并复制到剪贴板：" + s.url, "ok");
+        } else {
+          toast("链接已生成（但当前地址是从 Host 头拼不出来的，请在「设置 → 通知告警」填 link_base）", "warn");
+        }
+        loadShares();
+      }).catch(function (e) { toast(e.message, "err"); });
+  }
+
+  function copyText(t) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t).catch(function () {});
+      }
+    } catch (e) {}
+  }
+
+  function loadShares() {
+    var box = $("shareList");
+    if (!box || !isAdmin()) return;
+    api("api/shares").then(function (j) {
+      var rows = j.shares || [];
+      box.innerHTML = "";
+      if (!rows.length) { box.appendChild(el("p", "hint", "没有有效的分享链接。")); return; }
+      rows.forEach(function (s) {
+        var row = el("div", "list-row");
+        row.appendChild(el("span", "mono", "到期 " + fmtTime(s.exp)));
+        row.appendChild(el("span", null, (s.name || s.cam) + " " + hhmmss(s.from) + "–" + hhmmss(s.to)));
+        row.appendChild(el("span", "tag", Math.round((s.seconds || 0) / 60) + " 分钟"));
+        row.appendChild(el("span", "badge state-" + (s.alive ? "ok" : "broken"),
+                           s.alive ? ("剩 " + Math.max(0, Math.round((s.exp - Date.now() / 1000) / 3600)) + " 小时") : "已过期"));
+        row.appendChild(el("span", "hint", "被打开 " + (s.hits || 0) + " 次" +
+                                    (s.created_by ? " ｜ 由 " + s.created_by + " 分享" : "")));
+        if (s.url) {
+          var c = el("button", "btn small", "复制链接");
+          c.addEventListener("click", function () { copyText(s.url); toast("已复制", "ok"); });
+          row.appendChild(c);
+        }
+        var r = el("button", "btn small danger", "撤销");
+        r.addEventListener("click", function () {
+          if (!confirm("撤销这条链接？别人马上就看不了了。")) return;
+          api("api/shares/" + encodeURIComponent(s.token), { method: "DELETE" })
+            .then(function () { toast("已撤销", "ok"); loadShares(); })
+            .catch(function (e) { toast(e.message, "err"); });
+        });
+        row.appendChild(r);
+        box.appendChild(row);
+      });
+    }).catch(function (e) { box.textContent = "读不到分享列表：" + e.message; });
+  }
+
+  $("btnSharesRefresh").addEventListener("click", function () { loadExports(); loadShares(); });
+
+  /* ------------------------------------------------------------ 用户与授权 */
+  function loadUsers() {
+    var box = $("userList");
+    if (!box || !isAdmin()) return;
+    api("api/users").then(function (j) {
+      box.innerHTML = "";
+      (j.users || []).forEach(function (u) {
+        var row = el("div", "list-row");
+        row.appendChild(el("span", null, u.name));
+        row.appendChild(el("span", "tag", u.role === "admin" ? "管理员" : "只读"));
+        if (u.builtin) row.appendChild(el("span", "tag", "内置"));
+        row.appendChild(el("span", "hint", (u.cams || []).length
+          ? ("限 " + u.cams.join("、")) : "可看全部摄像头"));
+        if (!u.has_password) row.appendChild(el("span", "tag off", "还没设密码"));
+        if (!u.enabled) row.appendChild(el("span", "tag off", "已停用"));
+        if (!u.builtin) {
+          var pw = el("button", "btn small", "改密码");
+          pw.addEventListener("click", function () {
+            var p1 = prompt("给「" + u.name + "」设新密码（至少 6 位）：");
+            if (!p1) return;
+            api("api/users/" + encodeURIComponent(u.name),
+                { method: "PUT", body: { password: p1 } })
+              .then(function () { toast("已改（他的登录态立刻作废）", "ok"); loadUsers(); })
+              .catch(function (e) { toast(e.message, "err"); });
+          });
+          row.appendChild(pw);
+          var tg = el("button", "btn small", u.enabled ? "停用" : "启用");
+          tg.addEventListener("click", function () {
+            api("api/users/" + encodeURIComponent(u.name),
+                { method: "PUT", body: { enabled: !u.enabled } })
+              .then(function () { loadUsers(); })
+              .catch(function (e) { toast(e.message, "err"); });
+          });
+          row.appendChild(tg);
+          var del = el("button", "btn small danger", "删除");
+          del.addEventListener("click", function () {
+            if (!confirm("删除用户「" + u.name + "」？他的登录会立刻失效。")) return;
+            api("api/users/" + encodeURIComponent(u.name), { method: "DELETE" })
+              .then(function (j2) {
+                toast(j2.ok ? "已删除" : ("没删成：" + (j2.msg || "")), j2.ok ? "ok" : "err");
+                loadUsers();
+              }).catch(function (e) { toast(e.message, "err"); });
+          });
+          row.appendChild(del);
+        }
+        box.appendChild(row);
+      });
+      renderUserCamPick();
+    }).catch(function (e) { box.textContent = "读不到用户：" + e.message; });
+  }
+
+  function renderUserCamPick() {
+    var box = $("newUserCams");
+    if (!box) return;
+    var keep = {};
+    Array.prototype.forEach.call(box.querySelectorAll("input"), function (i) { keep[i.value] = i.checked; });
+    box.innerHTML = "";
+    if (!state.cams.length) {
+      box.appendChild(el("span", "hint", "还没有摄像头。"));
+      return;
+    }
+    state.cams.forEach(function (c) {
+      var lab = el("label", "check");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = String(c.id);
+      cb.checked = !!keep[String(c.id)];
+      lab.appendChild(cb);
+      lab.appendChild(el("span", null, c.name || c.id));
+      box.appendChild(lab);
+    });
+  }
+
+  $("btnUserAdd").addEventListener("click", function () {
+    var name = gv("newUserName").trim();
+    var pass = $("newUserPass").value;
+    if (!name) { toast("要填用户名", "err"); return; }
+    if (!pass || pass.length < 6) { toast("密码至少 6 位", "err"); return; }
+    var cams = Array.prototype.slice
+      .call(document.querySelectorAll("#newUserCams input:checked"))
+      .map(function (i) { return i.value; });
+    api("api/users", { method: "POST",
+                       body: { name: name, password: pass,
+                               role: gv("newUserRole") || "read", cams: cams } })
+      .then(function () {
+        toast("已添加 " + name + "（只读账号拿这个密码登录）", "ok");
+        $("newUserName").value = ""; $("newUserPass").value = "";
+        renderUserCamPick();
+        loadUsers();
+      }).catch(function (e) { toast(e.message, "err"); });
+  });
+
+  /* ------------------------------------------------------------ 审计日志 */
+  function loadAuditKinds() {
+    var sel = $("auditKind");
+    if (!sel || sel.options.length > 1) return;
+    api("api/audit/kinds").then(function (j) {
+      (j.kinds || []).forEach(function (k) {
+        sel.appendChild(el("option", null, k));
+      });
+    }).catch(function () {});
+  }
+
+  function loadAudit() {
+    var box = $("auditBox");
+    if (!box || !isAdmin()) return;
+    var qs = "days=" + (gn("auditDays", 7)) +
+             "&kind=" + encodeURIComponent(gv("auditKind")) +
+             "&actor=" + encodeURIComponent(gv("auditActor").trim());
+    api("api/audit?" + qs).then(function (j) {
+      var rows = j.rows || [], st = j.status || {};
+      box.innerHTML = "";
+      if (!rows.length) { box.appendChild(el("p", "hint", "这个条件下没有记录。")); }
+      rows.slice(0, 400).forEach(function (r) {
+        var row = el("div", "audit-row");
+        row.appendChild(el("span", "mono", r.at || fmtTime(r.ts)));
+        row.appendChild(el("span", "tag", r.kind || "—"));
+        row.appendChild(el("span", null, r.actor || "anonymous"));
+        if (r.ip) row.appendChild(el("span", "hint mono", r.ip));
+        var extra = Object.keys(r).filter(function (k) {
+          return ["ts", "at", "kind", "actor", "ip"].indexOf(k) < 0;
+        }).map(function (k) { return k + "=" + r[k]; }).join(" ");
+        if (extra) row.appendChild(el("span", "ai-desc", extra.slice(0, 220)));
+        box.appendChild(row);
+      });
+      var n = $("auditStat");
+      if (n) n.textContent = "今天共 " + (st.today || 0) + " 条 ｜ 内存里 " +
+        (st.in_memory || 0) + " 条 ｜ 保留 " + (st.retention_days || 90) + " 天 ｜ 本次显示 " +
+        Math.min(rows.length, 400) + " 条";
+    }).catch(function (e) { box.textContent = "读不到审计日志：" + e.message; });
+  }
+
+  $("btnAuditGo").addEventListener("click", function () { loadAudit(); loadAuditKinds(); });
+
+  /* ------------------------------------------------------------ 设置页填表 */
+  function fillGroupSettings() {
+    var s = state.settings || {};
+    var a = s.ai || {}, ig = s.integrity || {}, ar = s.archive || {};
+    sc("setAiOn", a.enabled);
+    sc("setAudioEv", a.audio_events !== false);
+    sv("setAudioThr", a.audio_threshold == null ? 2.5 : a.audio_threshold);
+    sc("setObjects", a.objects);
+    sv("setModelPath", a.model_path);
+    sv("setLabels", a.labels);
+    sv("setInputSize", a.input_size == null ? 640 : a.input_size);
+    sv("setObjConf", a.obj_confidence == null ? 0.35 : a.obj_confidence);
+    sc("setVlmOn", a.vlm_enabled);
+    sv("setVlmUrl", a.vlm_url);
+    sv("setVlmModel", a.vlm_model);
+    var vk = $("setVlmKey");
+    if (vk) {
+      vk.value = "";
+      vk.placeholder = a.vlm_key_set ? "已设置（留空 = 不修改）" : "留空 = 不修改";
+    }
+    sc("setIgOn", ig.enabled !== false);
+    sv("setIgDays", ig.days == null ? 7 : ig.days);
+    sv("setIgTol", ig.gap_tolerance == null ? 1.5 : ig.gap_tolerance);
+    sc("setArOn", ar.enabled);
+    sv("setArRemote", ar.remote);
+    sv("setArDays", ar.older_days == null ? 30 : ar.older_days);
+    sc("setArDel", ar.delete_local);
+    sc("setArAuto", ar.auto);
+    sv("setArHour", ar.auto_hour == null ? 4 : ar.auto_hour);
+    renderNotifState();
+    if (isAdmin()) {
+      loadAiState(); loadIntegrity(); loadArchive();
+      loadUsers(); loadExports(); loadShares(); loadAuditKinds();
+    }
+  }
+
+  /* ------------------------------------------------------------ PWA 与浏览器通知 */
+  var swReg = null;
+
+  function registerSW() {
+    if (!("serviceWorker" in navigator)) return;
+    // 非安全上下文里 SW 根本注册不上（浏览器直接拒），别把错误抛到控制台
+    if (!window.isSecureContext) return;
+    navigator.serviceWorker.register(url("sw.js")).then(function (r) {
+      swReg = r;
+      renderNotifState();
+    }).catch(function (e) { console.warn("sw", e); });
+    navigator.serviceWorker.addEventListener("message", function (ev) {
+      var d = ev.data || {};
+      if (d.he === "goto") {
+        var m = /#event=([^@&]+)@(\d+)/.exec(String(d.url || ""));
+        if (m) gotoEventTs(decodeURIComponent(m[1]), parseInt(m[2], 10) || 0);
+      }
+    });
+  }
+
+  $("btnBell").addEventListener("click", function () {
+    if (!("Notification" in window)) { toast("这个浏览器没有通知接口", "err"); return; }
+    if (state.notif.on) {
+      state.notif.on = false;
+      sc("setNotifOn", false);
+    } else if (notifAllowed()) {
+      state.notif.on = true;
+      sc("setNotifOn", true);
+    } else {
+      Notification.requestPermission().then(function (p) {
+        state.notif.on = p === "granted";
+        sc("setNotifOn", state.notif.on);
+        renderNotifState();
+        toast(state.notif.on ? "已允许本页通知"
+                             : ("浏览器拒绝（" + p + "）：HTTP 直连时拿不到通知权限，请用 https 地址"),
+              state.notif.on ? "ok" : "warn");
+        return;
+      });
+    }
+    try { localStorage.setItem("nw.notif", state.notif.on ? "1" : "0"); } catch (e) {}
+    renderBell();
+    renderNotifState();
+  });
+
+  function renderBell() {
+    var b = $("btnBell");
+    if (!b) return;
+    b.textContent = state.notif.on ? "🔔 通知已开" : "🔕 通知未开";
+    b.className = "chip btn-chip" + (state.notif.on ? " on" : "");
+  }
+
+  function notifAllowed() {
+    return ("Notification" in window) && Notification.permission === "granted";
+  }
+
+  function renderNotifState() {
+    var n = $("notifState");
+    if (!n) return;
+    if (!("Notification" in window)) {
+      n.textContent = "状态：这个浏览器没有通知接口（旧版 WebView）。";
+      return;
+    }
+    var secure = window.isSecureContext ||
+                 ["localhost", "127.0.0.1"].indexOf(location.hostname) >= 0;
+    n.textContent = "通知权限：" + Notification.permission +
+      "；页面地址" + (secure ? "是安全上下文（可以通知与安装）" :
+        "不是 HTTPS（浏览器会拒绝通知与服务 Worker，请用 https://NAS:8443 访问）") +
+      "；本页通知：" + (state.notif.on ? "开" : "关") +
+      "；Service Worker：" + (swReg ? "已注册" : (secure ? "未注册" : "不可用"));
+  }
+
+  $("btnNotifAsk").addEventListener("click", function () {
+    if (!("Notification" in window)) { toast("这个浏览器不支持通知", "err"); return; }
+    Notification.requestPermission().then(function (p) {
+      state.notif.on = p === "granted";
+      try { localStorage.setItem("nw.notif", state.notif.on ? "1" : "0"); } catch (e) {}
+      renderNotifState();
+      renderBell();
+      toast(p === "granted" ? "已允许：页面开着时新事件会弹通知"
+                            : ("浏览器拒绝（" + p + "）—— HTTP 直连时这是必然结果"),
+            p === "granted" ? "ok" : "warn");
+    });
+  });
+
+  $("btnNotifTest").addEventListener("click", function () {
+    if (!notifAllowed()) { toast("还没允许通知，先点「允许本页面通知」", "err"); return; }
+    showEventNotification({ name: (state.cams[0] || {}).name || "测试",
+                            t0: Math.floor(Date.now() / 1000),
+                            kind: "motion", labels: ["移动"] }, true);
+  });
+
+  $("setNotifOn") && $("setNotifOn").addEventListener("change", function () {
+    state.notif.on = this.checked;
+    try { localStorage.setItem("nw.notif", this.checked ? "1" : "0"); } catch (e) {}
+    renderNotifState();
+    renderBell();
+    if (this.checked && !notifAllowed()) $("btnNotifAsk").click();
+  });
+
+  function showEventNotification(it, manual) {
+    var body = (manual ? "测试：" : "") + (it.name || it.cam) + " " +
+      hhmmss(it.t0) + " " + fmtLabels(it) + (it.desc ? ("：" + it.desc) : "");
+    var link = location.pathname + "#event=" +
+      encodeURIComponent(it.cam) + "@" + Math.floor(it.t0);
+    var opts = { body: body, icon: url("icons/icon-192.png"),
+                 badge: url("icons/icon-192.png"), data: { url: link }, tag: "he-" + it.cam };
+    // 用 registration.showNotification 而不是 new Notification：只有前者
+    // 的点击会进 service worker 的 notificationclick，从而跳到那一刻的回放
+    if (swReg && swReg.showNotification) {
+      swReg.showNotification("HomeEye " + (it.name || it.cam), opts);
+    } else {
+      try { new Notification("HomeEye " + (it.name || it.cam), opts); } catch (e) {}
+    }
+  }
+
+  var notifPollTimer = null;
+
+  function startNotifPolling() {
+    if (notifPollTimer) return;
+    notifPollTimer = setInterval(function () {
+      if (!state.notif.on || !notifAllowed() || document.hidden) return;
+      api("api/events/latest?since=" + state.notif.last).then(function (j) {
+        var evs = j.events || [];
+        state.notif.last = j.now || Math.floor(Date.now() / 1000);
+        evs.slice(0, 3).reverse().forEach(function (it) { showEventNotification(it, false); });
+      }).catch(function () { /* 轮询失败静默：8 秒一次的 refresh 已经会报网络问题 */ });
+    }, 30000);
+  }
+
+  /* ------------------------------------------------------------ 启动/切换时的补充 */
+  window.addEventListener("hashchange", applyHashJump);
 
   /* ------------------------------------------------------------ 启动 */
   state.grid = parseInt(localStorage.getItem("nw.grid") || "4", 10) || 4;
@@ -2981,9 +4231,25 @@
     b.classList.toggle("on", parseInt(b.getAttribute("data-n"), 10) === state.grid);
   });
 
+  // 倍速与本页通知都存本地浏览器偏好：换台手机重新设一次就好，不该写进服务器配置
+  state.speed = Math.min(16, Math.max(1, parseFloat(localStorage.getItem("nw.speed") || "1")) || 1);
+  Array.prototype.forEach.call(document.querySelectorAll("#speedPick button"), function (b) {
+    b.classList.toggle("on", parseFloat(b.getAttribute("data-rate")) === state.speed);
+  });
+  state.notif.on = localStorage.getItem("nw.notif") === "1";
+  state.notif.last = Math.floor(Date.now() / 1000);   // 从"现在"起才算新事件，别把历史一次性弹出来
+  sc("setNotifOn", state.notif.on);
+  renderBell();
+
   decoratePasswords();
   buildSettingsNav();
-  refresh();
+  applyRole();
+  registerSW();
+  startNotifPolling();
+  refresh().then(function () {
+    // 通知点进来的深链：等摄像头列表到位再跳，否则 playCam 里还没有这一路
+    applyHashJump();
+  });
   setInterval(refresh, 8000);
 
   document.addEventListener("visibilitychange", function () {

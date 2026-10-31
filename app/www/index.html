@@ -4,9 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0d1117">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
 <!--BASE-->
 <title>HomeEye</title>
-<link rel="stylesheet" href="style.css?v=8">
+<link rel="stylesheet" href="style.css?v=11">
 </head>
 <body>
 
@@ -28,9 +35,11 @@
   </nav>
 
   <div class="top-right">
+    <button class="chip btn-chip" id="btnBell" title="开启浏览器通知：有新事件时提醒（需 HTTPS 或本机访问）">🔔 开启通知</button>
     <span class="chip" id="chipStorage" title="录像占用">—</span>
     <span class="chip dot-chip" id="chipHealth" title="链路健康：正常 / 离线（断电，不告警）/ 异常"><i class="dot"></i><span>链路检测中</span></span>
     <span class="chip dot-chip" id="chipRec"><i class="dot"></i><span>待机</span></span>
+    <span class="chip" id="chipUser" title="当前登录用户与角色" hidden>—</span>
   </div>
 </header>
 
@@ -83,6 +92,14 @@
     <div class="play-toolbar">
       <select id="playCam" class="select"></select>
       <div class="days" id="dayList"></div>
+      <div class="seg" id="speedPick" title="倍速回放">
+        <button data-rate="1" class="on" title="正常速度">1×</button>
+        <button data-rate="2" title="二倍速">2×</button>
+        <button data-rate="4" title="四倍速">4×</button>
+        <button data-rate="8" title="八倍速">8×</button>
+        <button data-rate="16" title="十六倍速（快速翻一天）">16×</button>
+      </div>
+      <button class="btn ghost" id="btnExportSeg" title="把当前时间轴选中的时段导成一个 mp4">⬇ 导出片段</button>
       <div class="spacer"></div>
       <span class="mono" id="playClock">--:--:--</span>
     </div>
@@ -109,6 +126,49 @@
     </div>
     <div class="tl-hint">点时间轴任意位置跳转；空白处代表那一刻没有录像，<b>亮色事件块</b>是侦测到「有动静」的时段</div>
     <div class="ev-strip" id="evStrip" hidden></div>
+
+    <!-- ---------- 片段导出（管理员） ---------- -->
+    <div class="export-panel" id="exportPanel" hidden>
+      <div class="field-row">
+        <div class="field">
+          <label>开始时间</label>
+          <input id="expFrom" type="datetime-local" step="1">
+        </div>
+        <div class="field">
+          <label>结束时间</label>
+          <input id="expTo" type="datetime-local" step="1">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>备注（会进审计日志）</label>
+          <input id="expNote" type="text" maxlength="80" placeholder="例如：给物业查 10-30 门口">
+        </div>
+        <div class="field">
+          <label class="check">
+            <input type="checkbox" id="expMask" checked> <span>套用隐私遮蔽（导出时打码）</span>
+          </label>
+          <p class="hint">关掉就是把原始画面拿走 —— 没开遮蔽的摄像头导出即无码。</p>
+        </div>
+      </div>
+      <div class="row-end">
+        <button class="btn ghost" id="btnExportClose">收起</button>
+        <button class="btn primary" id="btnExportGo">开始导出</button>
+      </div>
+      <p class="hint" id="exportState">导出是一次性转码，长度上限 2 小时；完成后可下载或生成带有效期的分享链接。</p>
+    </div>
+
+    <!-- ---------- 自然语言检索 ---------- -->
+    <div class="ai-bar">
+      <input id="aiQuery" type="text" spellcheck="false"
+             placeholder="检索：昨天下午客厅有人 / 今天有声响 / 前天门口快递">
+      <button class="btn primary" id="btnAiSearch">检索</button>
+      <div class="ai-results" id="aiResults" hidden></div>
+      <p class="hint" id="aiHint">
+        检索范围 = 你有权限的摄像头。时间说法认「今天 / 昨天 / 前天 / 上午 / 下午 / 晚上」，
+        关键词匹配事件类型（移动、声响、人形…）、VLM 写的一句话描述和摄像头名。
+      </p>
+    </div>
   </section>
 
   <!-- ================= 设置 ================= -->
@@ -269,7 +329,8 @@
         <div class="field-row">
           <div class="field">
             <label>保留天数（0 = 不删除）</label>
-            <input id="setRetention" type="number" min="0" max="3650" step="1">
+            <input id="setRetention" type="number" min="0" max="365" step="1">
+            <p class="hint">最多 365 天：这条盘上的画面不该被配成"事实上的永久留存"。要留更久请走冷层归档，或把 0（不自动删）+ 容量上限当成明确的运维选择。</p>
           </div>
           <div class="field">
             <label>容量上限（GB，0 = 不限）</label>
@@ -672,6 +733,245 @@
       </div>
 
       <div class="card">
+        <h3>本地 AI 检测 <span class="card-sub">声响事件 / 对象识别 / VLM 描述</span></h3>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="setAiOn"> <span>启用本地 AI 分析</span></label>
+          <p class="hint">关掉后下面的声音/对象都不再产出事件；已经写下的事件记录不会删。</p>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setAudioEv"> <span>记录「声响」事件</span></label>
+            <p class="hint">从录像音轨算 RMS 音量，明显高过本底的一瞬记一条。</p>
+          </div>
+          <div class="field">
+            <label>声响灵敏度（本底的倍数，越大越迟钝）</label>
+            <input id="setAudioThr" type="number" min="1.2" max="20" step="0.1">
+          </div>
+        </div>
+        <p class="hint">
+          <b>诚实说明：</b>音量突增只能判「有声响」（玻璃碎、婴儿哭、门铃都归到这里），
+          不能分辨是哪一种 —— 页面与通知里也只写「声响」，不假装认得出声音内容。
+        </p>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setObjects"> <span>启用对象识别（ONNX）</span></label>
+            <p class="hint">需要容器里有 onnxruntime + numpy 和一个 .onnx 模型；缺一样就在下面的状态里写清缺什么。</p>
+          </div>
+          <div class="field">
+            <label>置信度阈值（0.05~0.95）</label>
+            <input id="setObjConf" type="number" min="0.05" max="0.95" step="0.05">
+          </div>
+        </div>
+        <div class="field">
+          <label>模型文件路径（容器内绝对路径）</label>
+          <input id="setModelPath" type="text" spellcheck="false"
+                 placeholder="/data/models/yolov8n.onnx">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>类别中文名（逗号分隔，留空用内置人/车/宠物）</label>
+            <input id="setLabels" type="text" spellcheck="false" placeholder="人,车,狗,猫">
+          </div>
+          <div class="field">
+            <label>模型输入边长</label>
+            <input id="setInputSize" type="number" min="160" max="1280" step="32">
+          </div>
+        </div>
+        <h4 class="sub-h">可选：让视觉模型给事件写一句话</h4>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="setVlmOn"> <span>为事件生成一句话描述（可自然语言检索）</span></label>
+          <p class="hint">
+            走 OpenAI 兼容的 <code>/chat/completions</code>。
+            <b>会把事件缩略图发给外部服务</b> —— 只在你能接受这件事时开启；
+            不配就完全不出网，事件仍按「移动 / 声响 / 对象」检索。
+          </p>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>服务地址</label>
+            <input id="setVlmUrl" type="text" spellcheck="false" placeholder="https://api.example.com/v1">
+          </div>
+          <div class="field">
+            <label>模型名</label>
+            <input id="setVlmModel" type="text" spellcheck="false" placeholder="qwen-vl-plus">
+          </div>
+        </div>
+        <div class="field">
+          <label>API Key</label>
+          <input id="setVlmKey" type="password" autocomplete="off" placeholder="留空 = 不修改">
+        </div>
+        <p class="hint" id="aiState">状态：—</p>
+      </div>
+
+      <div class="card">
+        <h3>录像完整性自检 <span class="card-sub">丢帧 / 空洞清单</span></h3>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setIgOn"> <span>每 6 小时自动自检</span></label>
+          </div>
+          <div class="field">
+            <label>往回看几天（1~62）</label>
+            <input id="setIgDays" type="number" min="1" max="62" step="1">
+          </div>
+          <div class="field">
+            <label>空洞容差（1.0~6.0，太敏感会误报）</label>
+            <input id="setIgTol" type="number" min="1.0" max="6.0" step="0.1">
+          </div>
+        </div>
+        <div class="row-end" style="margin-bottom:6px">
+          <button class="btn ghost" id="btnIgDeep">深度自检（逐段读时长）</button>
+          <button class="btn primary" id="btnIgScan">立即自检</button>
+        </div>
+        <div id="integrityBox" class="list-box">状态：—</div>
+        <p class="hint">
+          自检按分段<b>起始时间</b>排：两段起点差明显大于一段的时长就算中间少了一段。
+          深度模式还会用 ffprobe 逐段读时长，能揪出「文件在但读不出来」的坏段，代价是慢。
+          SD 卡回补（设备侧录像）是另一条路，在「移动侦测」那张卡里配。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>冷层归档 <span class="card-sub">rclone 上云</span></h3>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setArOn"> <span>启用归档</span></label>
+          </div>
+          <div class="field">
+            <label>远端（rclone remote:桶，如 <code>cloud:homeeye-cold</code>）</label>
+            <input id="setArRemote" type="text" spellcheck="false" placeholder="cloud:homeeye-cold">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>比这更老的段才搬（天）</label>
+            <input id="setArDays" type="number" min="1" max="3650" step="1">
+          </div>
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setArDel"> <span>搬成功并核对字节后删本地</span></label>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setArAuto"> <span>每天自动跑一轮</span></label>
+          </div>
+          <div class="field">
+            <label>跑的那个小时（0~23）</label>
+            <input id="setArHour" type="number" min="0" max="23" step="1">
+          </div>
+        </div>
+        <div class="row-end" style="margin-bottom:6px">
+          <button class="btn ghost" id="btnArCancel">停止</button>
+          <button class="btn primary" id="btnArRun">立即归档一轮</button>
+        </div>
+        <div id="archiveBox" class="list-box">状态：—</div>
+        <p class="hint">
+          rclone 的 remote 是在容器里配的（<code>rclone config</code>），HomeEye 只负责调它搬文件；
+          找不到 rclone 二进制时这里会直说「不可用」，不会假装在搬。
+          「删本地」只在远端文件大小核对一致之后才执行。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>导出与分享 <span class="card-sub">mp4 片段 / 带有效期的链接</span></h3>
+        <div class="row-end" style="margin-bottom:6px">
+          <button class="btn ghost" id="btnSharesRefresh">刷新列表</button>
+        </div>
+        <h4 class="sub-h">导出任务</h4>
+        <div id="exportList" class="list-box">—</div>
+        <h4 class="sub-h">分享链接（免登录，到期自动失效）</h4>
+        <div id="shareList" class="list-box">—</div>
+        <p class="hint">
+          在「录像回放」里点「⬇ 导出片段」建任务；完成后这里能下载，也能生成分享链接。
+          链接任何人拿到都能看，<b>有效期一到就打不开</b>，随时可以在这里撤销。
+          每一次打开分享链接都会进审计日志。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>用户与授权 <span class="card-sub">家庭成员只读</span></h3>
+        <div id="userList" class="list-box">—</div>
+        <h4 class="sub-h">新增用户</h4>
+        <div class="field-row">
+          <div class="field">
+            <label>用户名</label>
+            <input id="newUserName" type="text" spellcheck="false" autocomplete="off" placeholder="例如：家人">
+          </div>
+          <div class="field">
+            <label>密码（至少 6 位）</label>
+            <input id="newUserPass" type="password" autocomplete="new-password">
+          </div>
+          <div class="field">
+            <label>角色</label>
+            <select id="newUserRole" class="select">
+              <option value="read">只读（只能看授权的画面与回放）</option>
+              <option value="admin">管理员（可改设置、加摄像头、导出）</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>允许查看的摄像头（一个都不勾 = 全部可看）</label>
+          <div id="newUserCams" class="check-row"></div>
+        </div>
+        <div class="row-end">
+          <button class="btn primary" id="btnUserAdd">添加用户</button>
+        </div>
+        <p class="hint">
+          内置管理员账号在「账号安全」里改密码，这里列出的第一个就是它。
+          拦截发生在数据出口：只读用户即使拿到别人的链接，请求别的摄像头也一样拿不到画面。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>审计日志 <span class="card-sub">谁看过哪段 / 谁改了什么</span></h3>
+        <div class="field-row">
+          <div class="field">
+            <label>往回看几天</label>
+            <input id="auditDays" type="number" min="0" max="90" step="1" value="7">
+          </div>
+          <div class="field">
+            <label>类型</label>
+            <select id="auditKind" class="select"><option value="">（全部）</option></select>
+          </div>
+          <div class="field">
+            <label>操作者</label>
+            <input id="auditActor" type="text" spellcheck="false" placeholder="（全部）">
+          </div>
+        </div>
+        <div class="row-end" style="margin-bottom:6px">
+          <button class="btn primary" id="btnAuditGo">查询</button>
+        </div>
+        <div id="auditBox" class="list-box tall">状态：—</div>
+        <p class="hint" id="auditStat">—</p>
+        <p class="hint">
+          同一个人反复拖同一段，5 分钟内只记一条「看过」，否则一次拖动就能刷出上百行。
+          设置改动只记「改了哪几组 + 后端的钳制说明」，
+          <b>不记具体值</b> —— 配置里有 SMTP 口令、passToken、VLM key，写进日志等于把秘密抄进另一个文件。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>通知与安装 <span class="card-sub">PWA / 浏览器通知</span></h3>
+        <div class="row-end" style="margin-bottom:6px">
+          <button class="btn ghost" id="btnNotifTest">发一条测试通知</button>
+          <button class="btn primary" id="btnNotifAsk">允许本页面通知</button>
+        </div>
+        <p class="hint" id="notifState">状态：—</p>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="setNotifOn"> <span>页面开着时，新事件弹浏览器通知</span></label>
+          <p class="hint">通知存本地浏览器偏好，不写进服务器配置。</p>
+        </div>
+        <p class="hint">
+          <b>能做到什么：</b>用手机浏览器「添加到主屏幕」装成 App（全屏、有图标），
+          页面开着或后台标签还活着时，新事件会弹系统通知，点通知直接跳到那一刻的回放。<br>
+          <b>做不到什么（诚实说明）：</b>浏览器关掉之后的<b>服务器主动推送</b>（Web Push）
+          需要 ES256 签名的 VAPID，本项目的后端只用 Python 标准库、不引第三方加密包，
+          因此没实现 —— 想要离线告警请用「通知告警」里的邮件 / Bark / 企业微信 / 钉钉。
+          另外浏览器只在 <b>HTTPS 或 localhost</b> 下允许通知，
+          用 <code>http://192.168.x.x:8088</code> 直连时上面两个按钮都会被拒绝。
+        </p>
+      </div>
+
+      <div class="card">
         <h3>存储占用</h3>
         <div id="usageBox" class="usage-box">—</div>
       </div>
@@ -766,8 +1066,12 @@
         </div>
         <div class="field" id="fieldUrl">
           <label>流地址</label>
-          <input id="camUrl" type="text" spellcheck="false"
-                 placeholder="rtsp://admin:密码@192.168.1.64:554/Streaming/Channels/101">
+          <div class="url-row">
+            <input id="camUrl" type="text" spellcheck="false"
+                   placeholder="rtsp://admin:密码@192.168.1.64:554/Streaming/Channels/101">
+            <button id="btnRevealUrl" class="btn ghost small" hidden>显示完整地址</button>
+          </div>
+          <p class="hint" id="urlSecretHint" hidden>口令已隐去（列表接口不回传明文）。不改动就沿用原口令，要换就直接填新地址。</p>
         </div>
         <div class="field" id="fieldUrlLow" hidden>
           <label>子码流地址（选填，多宫格用）</label>
@@ -816,6 +1120,27 @@
             <label class="check"><input type="checkbox" id="camRecord" checked> <span>录像</span></label>
             <label class="check"><input type="checkbox" id="camEnabled" checked> <span>启用</span></label>
           </div>
+        </div>
+        <!-- 隐私遮蔽编辑器：拖动框选，坐标按 0~1 归一化提交 -->
+        <div class="field" id="fieldPrivacy">
+          <label>隐私遮蔽区域 <span class="card-sub">实时画面与录像里都会盖住</span></label>
+          <div class="mask-wrap">
+            <div class="mask-stage" id="maskStage">
+              <img id="maskShot" alt="" draggable="false">
+              <div class="mask-shapes" id="maskShapes"></div>
+              <span class="mask-tip" id="maskTip">在画面上按住拖动，框出要盖住的区域</span>
+            </div>
+            <div class="mask-list" id="maskList"></div>
+          </div>
+          <div class="row-end" style="margin-top:6px">
+            <button class="btn ghost" id="btnMaskShot" type="button">取一帧当底图</button>
+            <button class="btn ghost" id="btnMaskClear" type="button">清空全部</button>
+          </div>
+          <p class="hint" id="maskHint">
+            最多 8 块。<b>遮蔽烧进像素</b>：这一路的实时与录像会强制重编码（CPU 上升），
+            保存后取流与录像自动重建；回放里看不到被盖住的原始内容。
+            没画区域的摄像头，导出拿到的就是原片。
+          </p>
         </div>
         <!-- 测试连接的结果提示（openCamModal 会写这里，缺失会导致弹窗打不开） -->
         <p class="hint" id="camTestHint"></p>
@@ -869,6 +1194,6 @@
 </div>
 
 <script src="mpegts.min.js"></script>
-<script src="app.js?v=27"></script>
+<script src="app.js?v=29"></script>
 </body>
 </html>

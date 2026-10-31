@@ -312,38 +312,107 @@ def _candidates(root, cfg):
     return sorted(out)
 
 
+def _thumb_rel(root, cid, base, path, t0, t1):
+    """事件缩略图的相对路径（目录不在就先建，建不成返回空 = 不带图）。"""
+    rel = "th/%s-%d.jpg" % (base, int(t0))
+    full = os.path.join(events_root(root), cid, "th")
+    try:
+        os.makedirs(full, exist_ok=True)
+    except OSError:
+        return ""
+    make_thumb(path, max(0.0, (t1 - t0) / 2.0), os.path.join(full,
+             os.path.basename(rel)))
+    return "%s/%s" % (cid, rel)
+
+
 def _process_one(root, rel, path, cfg, cams_by_id):
+    """一段写完的分段 -> 事件行（画面动静 / 声响 / 可选的对象标签与一句话描述）。
+
+    三条来源各自独立开关：像素差分归 `motion.enabled`，声响与识别归 `ai.enabled`
+    下面的分项。开着哪条才做哪条 —— 解码一次分段是要花真 CPU 的，不能因为"AI
+    打开了"就去做根本没启用的画面分析。
+    """
     global _last
     cid = rel.split("/")[0]
     cam = cams_by_id.get(cid) or {}
     mo = cfg.get("motion") or {}
-    sens = mo.get("sensitivity", 50)
+    ai = cfg.get("ai") or {}
+    ai_on = bool(ai.get("enabled"))
     ts0 = seg_ts(os.path.basename(path))
-    evs = detect_events(path, ts0, sens)
-    rows = []
     base = os.path.basename(path)[:-len(".mp4")]
-    thdir = os.path.join(events_root(root), cid, "th")
-    os.makedirs(thdir, exist_ok=True)
-    for (t0, t1, score) in evs:
-        thumb = "th/%s-%d.jpg" % (base, int(t0))
-        make_thumb(path, max(0.0, (t1 - t0) / 2.0),
-                   os.path.join(events_root(root), cid, thumb))
-        rows.append({"t0": t0, "t1": t1, "score": score,
-                     "file": rel, "thumb": "%s/%s" % (cid, thumb)})
+    rows = []
+    motion_rows = []
+    if mo.get("enabled"):
+        evs = detect_events(path, ts0, mo.get("sensitivity", 50))
+        for (t0, t1, score) in evs:
+            motion_rows.append({"t0": t0, "t1": t1, "score": score,
+                                "file": rel,
+                                "thumb": _thumb_rel(root, cid, base, path, t0, t1),
+                                "kind": "motion", "labels": ["移动"]})
+        if ai_on and ai.get("objects"):
+            try:
+                import nw_ai as AI
+                AI.annotate_objects(path, ts0, evs, motion_rows, ai)
+            except Exception as e:
+                _note_err("objects", e)
+    rows.extend(motion_rows)
+
+    if ai_on and ai.get("audio_events"):
+        try:
+            import nw_ai as AI
+            for (t0, t1, score) in AI.audio_events(
+                    path, ts0, ai.get("audio_threshold", 2.5)):
+                rows.append({"t0": t0, "t1": t1, "score": score,
+                             "file": rel,
+                             "thumb": _thumb_rel(root, cid, base, path, t0, t1),
+                             "kind": "audio", "labels": ["声响"]})
+        except Exception as e:
+            _note_err("audio", e)
+
+    # VLM 要外发一帧画面到第三方接口，所以只给最长的一两条写描述：一段 5 分钟
+    # 里可能有几十个事件，全问一遍既慢又烧钱，还让"关掉就什么都不发"变得说不清。
+    if ai_on and ai.get("vlm_enabled") and rows:
+        try:
+            import nw_ai as AI
+            picks = sorted(rows, key=lambda r: -(r["t1"] - r["t0"]))[:2]
+            for row in picks:
+                text = AI.describe_event(path, ts0, row, ai)
+                if text:
+                    row["desc"] = text
+        except Exception as e:
+            _note_err("vlm", e)
+
+    rows.sort(key=lambda r: r["t0"])
     day = time.strftime("%Y%m%d", time.localtime(ts0))
+    first_ts = rows[0]["t0"] if rows else ts0
     if rows:
         append_events(root, cid, day, rows)
         # 1.2.0-D：扫出动静就发通知（受总开关/on_motion/布防/冷却约束，
         # 布防撤防逻辑在 nw_notify 里）
         try:
             import nw_notify as N
-            N.notify_local_event(cam.get("name") or cid, len(rows), evs[0][0])
+            tags = []
+            for r in rows:
+                for lab in (r.get("labels") or []):
+                    if lab not in tags:
+                        tags.append(lab)
+            N.notify_local_event(cam.get("name") or cid, len(rows), first_ts,
+                                 labels=tags, cam_id=cid, t0=first_ts)
         except Exception:
             pass
     st = load_state(root)
     st[rel] = {"st": "done", "mt": os.path.getmtime(path), "n": len(rows)}
     save_state(root)
     _last = "%s %s -> %d 事件" % (time.strftime("%H:%M:%S"), rel, len(rows))
+
+
+def _note_err(which, exc):
+    """AI 某一侧失败不影响画面事件照常入库，但要把原因留给设置页说清楚。"""
+    try:
+        import nw_ai as AI
+        AI.note_error(which, str(exc)[:160])
+    except Exception:
+        pass
 
 
 def _prune(root):
@@ -416,7 +485,10 @@ def scan_once():
     root = C.recordings_root()
     cfg = C.load()
     mo = cfg.get("motion") or {}
-    if not mo.get("enabled"):
+    ai = cfg.get("ai") or {}
+    # 画面动静和本地 AI 是两条独立来源：只开 AI（只听声响/只识别对象）时
+    # 扫描循环照样要转，否则 ai.enabled 会变成一格骗人的开关。
+    if not mo.get("enabled") and not ai.get("enabled"):
         return 0
     cams_by_id = {str(c.get("id")): c for c in (cfg.get("cameras") or [])}
     cands = _candidates(root, cfg)

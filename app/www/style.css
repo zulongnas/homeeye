@@ -201,6 +201,17 @@ main { flex: 1 1 auto; min-height: 0; position: relative; }
 .tile.single .tile-name { font-size: 14px; padding: 8px 12px; }
 .tile.focused { outline: 1px solid rgba(240,180,41,.5); outline-offset: -1px; }
 
+/* 停车场的几路画面：离屏极小容器，播放器/MSE 缓冲继续活着但用户看不见。
+   用 2px 而不是 display:none —— 后者在部分浏览器会冻结媒体解码。 */
+.tile-park {
+  position: fixed; left: -10000px; top: 0;
+  width: 2px; height: 2px;
+  overflow: hidden; opacity: 0;
+  pointer-events: none;
+}
+.tile-park .tile { width: 2px; height: 2px; border: 0; }
+.tile-park .tile video { width: 2px; height: 2px; }
+
 .empty {
   position: absolute; inset: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -399,6 +410,10 @@ body.fs-on { overflow: hidden; }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; flex: 1 1 0; min-width: 0; }
 .field label { font-size: 12.5px; color: var(--muted); }
 .field-row { display: flex; gap: 12px; flex-wrap: wrap; }
+/* 流地址 + 「显示完整地址」并排：地址框自己撑满，按钮不被压扁 */
+.url-row { display: flex; gap: 8px; align-items: center; }
+.url-row input { flex: 1 1 auto; min-width: 0; }
+.url-row .btn { flex: 0 0 auto; }
 .field input[type=text], .field input[type=number], .field input[type=password] {
   height: 34px; padding: 0 10px;
   border-radius: 8px;
@@ -851,3 +866,143 @@ body.fs-on { overflow: hidden; }
 .ptz-btn:nth-child(3) { grid-area: 2 / 2; }
 .ptz-btn:nth-child(4) { grid-area: 2 / 3; }
 .ptz-btn:nth-child(5) { grid-area: 3 / 2; }
+
+/* ============================================================================
+   1.3：隐私遮蔽 / 导出分享 / AI 检索 / 完整性 / 归档 / 用户 / 审计 / PWA
+   约定：这些块都长在既有的深色变量上，不引入新颜色，只区分「信息层」与
+   「可操作层」——列表行可换行，徽章和标签永远不换行、不被压扁。
+   ========================================================================== */
+
+/* 列表行里会出现 <a class="btn small">下载</a>：a 默认带下划线且是 inline，
+   和 button 摆一起会错位，所以统一成 inline-flex。 */
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
+
+/* ------------------------------------------------------------ 顶栏小按钮 */
+.btn-chip { cursor: pointer; transition: .15s; }
+.btn-chip:hover { color: var(--text); border-color: #33465c; background: #1b2734; }
+.btn-chip.on { color: #b7f0c4; border-color: #1f4d2c; background: #10241a; }
+/* 只读账号的身份牌：用青蓝而不是管理员的琥珀，一眼分清身份但不暗示「出错」 */
+.chip-ro { color: #a8d4ff; border-color: #26496b; background: #10202f; }
+
+/* ------------------------------------------------------------ 通用列表盒 */
+.list-box {
+  display: flex; flex-direction: column;
+  max-height: 260px; overflow-y: auto;
+  border: 1px solid var(--line-soft); border-radius: 10px;
+  background: #0d141b; padding: 4px 10px;
+  font-size: 12.5px; color: #c3d0dd;
+}
+.list-box.tall { max-height: 420px; }
+.list-box .hint { padding: 8px 0; }
+.list-row {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.list-row:last-child { border-bottom: 0; }
+.list-row .btn { flex: 0 0 auto; }
+.check-row { display: flex; flex-wrap: wrap; gap: 2px 0; }
+
+/* 标签的两种新语义：遮蔽=这一路被强制重编码（黄色警示族）；
+   事件=一条侦测事件（青蓝信息族）。 */
+.tag.mask { color: #ffd479; border-color: #6a5218; background: #241d08; }
+.tag.ev { color: #a8d4ff; border-color: #26496b; background: #10202f; }
+/* VLM 写的一句话、导出备注、审计附加字段：可以长，让它换行且压暗 */
+.ai-desc { color: #93a6b8; font-size: 11.5px; line-height: 1.6; flex: 1 1 200px; min-width: 0; }
+
+/* ------------------------------------------------------------ 自然语言检索 */
+/* 播放页底部的一整块：第一行输入+按钮，下面两行占满整宽。 */
+.ai-bar {
+  flex: 0 0 auto;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-top: 10px;
+}
+.ai-bar input[type=text] {
+  flex: 1 1 260px; min-width: 0;
+  height: 32px; padding: 0 10px;
+  border-radius: 8px; border: 1px solid var(--line);
+  background: #0e1620; color: var(--text); font-size: 13px; outline: none;
+}
+.ai-bar input[type=text]:focus { border-color: #3c5573; }
+.ai-bar > .hint, .ai-results { flex: 1 0 100%; }
+.ai-results {
+  max-height: 168px; overflow-y: auto;
+  border: 1px solid var(--line-soft); border-radius: 10px;
+  background: #0d141b; padding: 6px 10px;
+}
+.ai-hit {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 6px 0; border-bottom: 1px solid var(--line-soft);
+  font-size: 12.5px; color: #c3d0dd;
+}
+.ai-hit:last-child { border-bottom: 0; }
+
+/* ------------------------------------------------------------ 片段导出面板 */
+.export-panel {
+  flex: 0 0 auto;
+  margin-top: 10px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel);
+}
+.export-panel .field { margin-bottom: 8px; }
+.export-panel .field input[type=text],
+.export-panel .field input[type=datetime-local] {
+  height: 34px; padding: 0 10px;
+  border-radius: 8px; border: 1px solid var(--line);
+  background: #0e1620; color: var(--text); font-size: 13px; outline: none;
+  color-scheme: dark;
+}
+.export-panel .field input:focus { border-color: #3c5573; }
+.export-panel .row-end { margin-top: 4px; }
+
+/* ------------------------------------------------------------ 遮蔽编辑器 */
+.mask-wrap { display: flex; flex-direction: column; gap: 8px; }
+.mask-stage {
+  position: relative;
+  width: 100%; aspect-ratio: 16 / 9;
+  background: #06090d center/contain no-repeat;
+  border: 1px solid var(--line); border-radius: 8px;
+  overflow: hidden;
+  cursor: crosshair;
+  touch-action: none; /* 手机上按住拖动，别让浏览器把 gesture 变成滚动 */
+  user-select: none; -webkit-user-select: none;
+}
+.mask-stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+.mask-shapes { position: absolute; inset: 0; pointer-events: none; }
+.mask-shape {
+  position: absolute;
+  border: 1px dashed #ffd479;
+  background: rgba(6, 9, 13, .82); /* 所见即所得：这就是烧进录像的那块黑 */
+}
+.mask-ghost { border-style: solid; border-color: var(--accent); background: rgba(240, 180, 41, .18); }
+.mask-tip {
+  position: absolute; left: 8px; bottom: 8px;
+  padding: 3px 8px; border-radius: 6px;
+  background: rgba(8, 12, 17, .74); color: #9fb0c2; font-size: 11.5px;
+  pointer-events: none;
+}
+.mask-tip[hidden] { display: none; }
+.mask-list { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: #9fb0c1; }
+.mask-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+
+/* ------------------------------------------------------------ 完整性 / 审计 */
+.ig-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 7px 0; border-bottom: 1px solid var(--line-soft);
+}
+.ig-row:last-child { border-bottom: 0; }
+.ig-gap { color: #d7dee6; font-size: 11.5px; line-height: 1.9; opacity: .8; }
+.audit-row {
+  display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap;
+  padding: 5px 0; border-bottom: 1px solid var(--line-soft);
+  font-size: 12px; color: #c3d0dd;
+}
+.audit-row:last-child { border-bottom: 0; }
+
+/* ------------------------------------------------------------ 设置页小节 */
+.card .sub-h { margin: 14px 0 8px; font-size: 12.5px; font-weight: 600; color: #9fb3c8; }
+.readonly-notice {
+  padding: 8px 12px; margin: 0 0 10px;
+  border-left: 3px solid #26496b; border-radius: 6px;
+  background: #10202f; color: #a8d4ff;
+}

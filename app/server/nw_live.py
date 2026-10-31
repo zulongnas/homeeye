@@ -29,6 +29,8 @@ import subprocess
 import threading
 import time
 
+import nw_privacy as PV
+
 TS_PACKET = 188
 # 环形缓冲：要盖得住一整个 GOP。按实测主码流 8 Mbps / GOP 3.35 s 算，
 # 4 MB ≈ 4 秒，够；子码流（1~2 Mbps）下是 20 秒，更够。
@@ -185,8 +187,15 @@ def forget_probe(url=None):
             _PROBE.clear()
 
 
-def transcode_needed(mode, codec):
-    """这一路到底要不要转码。返回 (要转吗, 给人看的一句原因)。"""
+def transcode_needed(mode, codec, masked=False):
+    """这一路到底要不要转码。返回 (要转吗, 给人看的一句原因)。
+
+    masked 为真（这路配了隐私遮蔽）时**任何档位都要转**，包括「不转码」：copy
+    只搬码流、改不了像素，遮蔽根本没上画面 —— 用户以为打了码其实没有，比多花
+    一个核严重得多。
+    """
+    if masked:
+        return True, "配了隐私遮蔽：遮蔽要在编码前烧进像素，这一路必须重编码"
     if mode == "always":
         return True, "设置里选了「总是转码」"
     if mode == "never":
@@ -272,6 +281,10 @@ class LiveCam(object):
         self.idle_stop = int(opts.get("idle_stop") or 12)
         # 直播是否带音频（设置页 live.audio）。关掉就完全不处理音轨，省 CPU。
         self.audio = bool(opts.get("audio", True))
+        # 隐私遮蔽（摄像头 privacy 段）。遮蔽条是滤镜，滤镜必须在编码前烧进像素，
+        # 所以只要配了遮蔽，这一路就**强制转码** —— 直拷等于把没打码的原画面
+        # 发给浏览器，那正是遮蔽想防的事。
+        self.mask_vf = PV.filters(cam)
 
         self._lock = threading.RLock()
         self._subs = []
@@ -315,9 +328,9 @@ class LiveCam(object):
         else:
             cmd += ["-an"]
         codec = None
-        if self.tmode == "auto":
+        if self.tmode == "auto" or self.mask_vf:
             codec, _note = probe_codec(self.url, self.transport)
-        need, note = transcode_needed(self.tmode, codec)
+        need, note = transcode_needed(self.tmode, codec, bool(self.mask_vf))
         self.mode_note = note
         self.effective = "transcode" if need else "copy"
         # 关键帧对齐要知道这条流的真实编码：转码出来必是 H.264，直拷就用探到的
@@ -329,8 +342,12 @@ class LiveCam(object):
                     # 中途加入的观看端会因为拿不到 PPS 而永久黑屏。
                     "-x264-params", "repeat-headers=1",
                     "-bsf:v", "dump_extra"]
-            if self.width > 0:
-                cmd += ["-vf", "scale='min(iw,%d)':-2" % self.width]
+            # 先缩放再涂遮蔽：drawbox 的 iw/ih 取的是它自己输入的尺寸，链上顺序
+            # 换了坐标含义就跟着换（主/子码流尺寸不同，归一化坐标才不会被带偏）。
+            vf = ["scale='min(iw,%d)':-2" % self.width] if self.width > 0 else []
+            vf += self.mask_vf
+            if vf:
+                cmd += ["-vf", ",".join(vf)]
             if self.fps > 0:
                 cmd += ["-r", str(self.fps)]
             cmd += ["-g", str(max(self.fps or 10, 1) * 2)]
@@ -433,13 +450,21 @@ class LiveCam(object):
                 except Exception:
                     pass
             with self._lock:
-                if self._proc is proc:
+                own = (self._proc is proc)
+                if own:
                     self._proc = None
+                    subs = list(self._subs)
                 else:
+                    subs = []
                     try:
                         proc.kill()    # 被顶替的进程必须收掉，否则它会继续写满管道
                     except Exception:
                         pass
+            # 发布进程自己退了：这一路的时间线到此为止，老订阅者再等也等不到
+            # 接续数据（MSE 会悄悄定格）。直接关掉订阅，让 HTTP 流立刻收尾，
+            # 浏览器按 LOADING_COMPLETE 快速重连 —— 不再靠前端 6 秒卡死检测兜底。
+            for s in subs:
+                s.close()
 
     def _feed(self, batch, koff=-1, proc=None):
         """把一批 TS 字节写进环形缓冲并广播给所有订阅者。
@@ -570,11 +595,14 @@ class LiveHub(object):
         opts = self._opts()
         with self._lock:
             lc = self._cams.get(key)
-            # 参数或地址变了就重建（改完设置不用重启应用）
+            # 参数或地址变了就重建（改完设置不用重启应用）。遮蔽区域也算参数：
+            # 改完遮蔽不重建的话，新画面还是旧遮罩（或反过来，删了遮蔽还在涂）。
             sig = (url, cam.get("transport"),
                    _tmode(opts.get("transcode")), bool(opts.get("audio", True)),
                    int(opts.get("width") or 0), int(opts.get("fps") or 0),
-                   int(opts.get("quality") or 23))
+                   int(opts.get("quality") or 23),
+                   tuple((m["x"], m["y"], m["w"], m["h"])
+                         for m in PV.masks_of(cam)))
             if lc is None or getattr(lc, "_sig", None) != sig:
                 if lc is not None:
                     lc._stop_proc()

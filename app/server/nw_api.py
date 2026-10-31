@@ -24,21 +24,30 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import nw_ai as AI
+import nw_archive as AR
+import nw_audit as AU
 import nw_auth as A
 import nw_config as C
 import nw_env as E
 import nw_events as EV
+import nw_export as EX
 import nw_health as H
+import nw_integrity as IG
 import nw_live as L
+import nw_privacy as PV
 import nw_record as R
 import nw_watchdog as W
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 BOUNDARY = "nwframe"
 
 _live = None
 _rec = None
 _httpd = None
+_viewed = {}
+_viewed_lock = threading.Lock()
+VIEW_AUDIT_TTL = 300.0
 
 
 # ---------------------------------------------------------------- 工具
@@ -207,6 +216,23 @@ def _ffprobe(url, transport="tcp", timeout=12):
         return False, str(e)[-300:]
 
 
+def _view_already_logged(key):
+    """同一个人反复拖同一段，5 分钟内只记一条"看过"。
+
+    为什么去重：一次回放会打十几个分段请求，全记下来会把有用的审计埋掉 ——
+    审计日志要回答的是"谁在什么时候看过客厅那段"，不是"他拖了几次进度条"。
+    """
+    now = time.time()
+    with _viewed_lock:
+        if len(_viewed) > 4000:
+            for k in [k for k, t in _viewed.items() if now - t > VIEW_AUDIT_TTL]:
+                _viewed.pop(k, None)
+        if now - _viewed.get(key, 0) < VIEW_AUDIT_TTL:
+            return True
+        _viewed[key] = now
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "HomeEye/" + VERSION
     protocol_version = "HTTP/1.1"
@@ -249,17 +275,28 @@ class Handler(BaseHTTPRequestHandler):
         self._j(obj, code)
 
     def _body(self):
+        """解析请求 JSON（带缓存：闸门和接口本身都要看同一个 body）。
+
+        rfile 只能读一次，不缓存的话第二个调用方永远拿到空 dict —— 表现是
+        "鉴权通过后接口说缺少参数"，很难猜。
+        """
+        cached = getattr(self, "_body_cache", None)
+        if cached is not None:
+            return cached
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             n = 0
         if n <= 0:
-            return {}
+            self._body_cache = {}
+            return self._body_cache
         raw = self.rfile.read(min(n, 4 * 1024 * 1024))
         try:
-            return json.loads(raw.decode("utf-8"))
+            out = json.loads(raw.decode("utf-8"))
         except Exception:
-            return {}
+            out = {}
+        self._body_cache = out if isinstance(out, dict) else {}
+        return self._body_cache
 
     def _raw_body(self, limit):
         """原样读 body（对讲音频是裸 PCM，不能按 JSON 解析）。"""
@@ -272,11 +309,68 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(min(n, limit))
 
     # ---------- 分发 ----------
-    def _logged_in(self):
-        """当前请求带着有效会话吗（网关模式视为已登录：飞牛网关自己鉴过）。"""
+    def _ip(self):
+        try:
+            return str((self.client_address or ("",))[0])
+        except Exception:
+            return ""
+
+    def _user(self):
+        """当前请求的会话（角色、授权摄像头都在里面）。
+
+        网关那一路没有 Cookie（飞牛已经鉴过权），当管理员看待；闸门关掉时
+        也没有 Cookie，但必须给一个等同管理员的匿名会话 —— 否则「关掉登录」
+        反而会让按摄像头授权把每一路都判成拒绝，页面一台摄像头都看不见。
+        其余一律用 token 换会话，拿不到 = 未登录。
+        """
         if A.is_gateway(self):
+            return A.gateway_session()
+        sess = A.current(A.token_from_headers(self.headers))
+        if sess is None and not A.enabled():
+            return A.open_session()
+        return sess
+
+    def _logged_in(self):
+        """当前请求带着有效会话吗（只回答"登没登录"，权限要看 `_user`）。"""
+        return self._user() is not None
+
+    def _actor(self):
+        sess = self._user() or {}
+        return str(sess.get("user") or "anonymous")
+
+    def _audit(self, kind, **fields):
+        """审计绝不能把业务请求带崩，所以整体吞异常。"""
+        try:
+            AU.log(kind, self._actor(), ip=self._ip(), **fields)
+        except Exception:
+            pass
+
+    def _require_admin(self):
+        """管理类接口（设置、摄像头增删、用户、导出分享）的统一入口闸门。"""
+        sess = self._user()
+        if sess is None:
+            self._err("需要登录", 401, auth=A.public_state(None))
+            return None
+        if not A.is_admin(sess):
+            self._err("需要管理员权限", 403, auth=A.public_state(sess))
+            return None
+        return sess
+
+    def _cam_ok_or_deny(self, cam_id, why="view"):
+        """按摄像头授权判定 —— 判在数据出口，不是把入口藏起来。
+
+        未授权的摄像头返回 404 而不是 403：403 会告诉只读用户"这路存在"，
+        而家庭账号本来就不该知道家里装了几台、装在哪儿。
+        """
+        sess = self._user()
+        if sess is None:
+            self._err("需要登录", 401, auth=A.public_state(None))
+            return False
+        if A.cam_ok(sess, cam_id):
             return True
-        return A.check(A.token_from_headers(self.headers))
+        self._audit("cam_denied", cam=str(cam_id), action=why)
+        self._send(404, b"not found", "text/plain")
+        return False
 
     def do_GET(self):
         self._route("GET")
@@ -294,8 +388,15 @@ class Handler(BaseHTTPRequestHandler):
         self._route("DELETE")
 
     def _route(self, method):
+        # keep-alive 会复用同一个 handler 实例：body 缓存必须每条请求清一次，
+        # 否则第二个请求会读到上一个请求的 JSON
+        self._body_cache = None
         u = urllib.parse.urlparse(self.path)
         path = self._strip_prefix(urllib.parse.unquote(u.path))
+        if ".." in path.split("/"):
+            # 解码以后还要再查一次：单页应用会把没认出来的路径回退成 index.html，
+            # %2e%2e/config.json 这种写法就是这样绕过守卫、还回个 200 的
+            return self._send(400, b"bad path", "text/plain")
         q = urllib.parse.parse_qs(u.query)
         try:
             # 鉴权闸门：/api、/live、/rec 全部要会话（网关模式与"未设密码"时放行）
@@ -306,6 +407,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err("需要登录", 401, auth=A.public_state())
             if path.startswith("/api/"):
                 return self._api(method, path, q)
+            if path.startswith("/share/"):
+                return self._share_route(path, method == "HEAD")
+            if path.startswith("/export/"):
+                return self._export_route(path, method == "HEAD")
             if path.startswith("/live/"):
                 return self._live_stream(path, q)
             if path.startswith("/rec/"):
@@ -334,12 +439,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, b"not found", "text/plain")
         full = os.path.join(C.WWW, *rel.split("/"))
         if not os.path.isfile(full):
+            # service worker 不参与单页回退：把 index.html 当 sw.js 发出去，
+            # 注册会"成功"但脚本内容是 HTML，结果是缓存整个坏掉且很难排查。
+            if rel in ("sw.js", "manifest.webmanifest"):
+                return self._send(404, b"not found", "text/plain")
             # 单页应用回退
             full = os.path.join(C.WWW, "index.html")
             if not os.path.isfile(full):
                 return self._send(404, b"not found", "text/plain")
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
+        if rel.endswith(".webmanifest"):
+            # 不给对 mime Chrome 直接拒绝解析清单（PWA 安装按钮不会出现）
+            ctype = "application/manifest+json"
+        elif rel.endswith(".js"):
+            ctype = "application/javascript; charset=utf-8"
+        elif rel.endswith(".json"):
+            ctype = "application/json; charset=utf-8"
+        if ctype.startswith("text/") and "charset" not in ctype:
             ctype += "; charset=utf-8"
         try:
             with open(full, "rb") as f:
@@ -363,10 +479,15 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 录像文件（Range） ----------
     def _file(self, path, q, head=False):
         rel = posixpath.normpath(path[len("/rec/"):]).lstrip("/")
+        cid = (rel.split("/", 1) or [""])[0]
+        if not self._cam_ok_or_deny(cid, "rec_read"):
+            return
         root = os.path.realpath(C.recordings_root())
         full = os.path.realpath(os.path.join(root, *rel.split("/")))
         if not full.startswith(root + os.sep) or not os.path.isfile(full):
             return self._send(404, b"not found", "text/plain")
+        if not _view_already_logged(("rec", self._actor(), rel)):
+            self._audit("rec_view", cam=cid, file=rel)
         size = os.path.getsize(full)
         rng = self.headers.get("Range") or ""
         start, end = 0, size - 1
@@ -428,6 +549,9 @@ class Handler(BaseHTTPRequestHandler):
         rel = posixpath.normpath(path[len("/replay/"):]).lstrip("/")
         if rel.endswith(".ts"):
             rel = rel[:-3]
+        cid = (rel.split("/", 1) or [""])[0]
+        if not self._cam_ok_or_deny(cid, "replay"):
+            return
         root = os.path.realpath(C.recordings_root())
         full = os.path.realpath(os.path.join(root, *rel.split("/")))
         if not full.startswith(root + os.sep) or not os.path.isfile(full):
@@ -440,6 +564,8 @@ class Handler(BaseHTTPRequestHandler):
             dur = max(0.0, float((q.get("dur") or ["0"])[0]))
         except ValueError:
             dur = 0.0
+        if not _view_already_logged(("replay", self._actor(), rel)):
+            self._audit("rec_view", cam=cid, file=rel, start=round(start, 1))
         cmd = [os.environ.get("HE_FFMPEG") or "ffmpeg",
                "-hide_banner", "-nostdin", "-loglevel", "error"]
         if start > 0:
@@ -492,6 +618,9 @@ class Handler(BaseHTTPRequestHandler):
         请求"，所以只要支持 start/dur 两个参数即可，起播点用 -ss 精确切。
         """
         rel = posixpath.normpath(path[len("/rech264/"):]).lstrip("/")
+        cid = (rel.split("/", 1) or [""])[0]
+        if not self._cam_ok_or_deny(cid, "replay_h264"):
+            return
         root = os.path.realpath(C.recordings_root())
         full = os.path.realpath(os.path.join(root, *rel.split("/")))
         if not full.startswith(root + os.sep) or not os.path.isfile(full):
@@ -504,6 +633,8 @@ class Handler(BaseHTTPRequestHandler):
             dur = max(0.5, float((q.get("dur") or ["300"])[0]))
         except ValueError:
             dur = 300.0
+        if not _view_already_logged(("h264", self._actor(), rel)):
+            self._audit("rec_view", cam=cid, file=rel, start=round(start, 1))
         try:
             cfg = C.load() or {}
             crf = int((cfg.get("live") or {}).get("quality") or 23)
@@ -568,6 +699,8 @@ class Handler(BaseHTTPRequestHandler):
         cam = C.get_camera(cam_id)
         if not cam:
             return self._send(404, b"no such camera", "text/plain")
+        if not self._cam_ok_or_deny(cam_id, "live"):
+            return
         # ?q=low 走子码流（没配 url_low 时 LiveHub 会自动回落主码流）
         tier = "low" if (q.get("q") or [""])[0] == "low" else "high"
         # 按类型分流：小米走 XiaomiHub，其余走 LiveHub（ffmpeg 拉流）
@@ -580,6 +713,9 @@ class Handler(BaseHTTPRequestHandler):
             lc = _live.get(cam, tier)
             sub = lc.add_sub()
             del_fn = lc.del_sub
+        if not _view_already_logged(("live", self._actor(), str(cam_id), tier)):
+            self._audit("live_view", cam=str(cam_id), name=cam.get("name") or "",
+                        tier=tier)
         self.close_connection = True
         try:
             self.send_response(200)
@@ -601,6 +737,8 @@ class Handler(BaseHTTPRequestHandler):
                 first = sub.take(2.0)
                 if first:
                     break
+                if sub.closed:
+                    break             # 发布进程重启，这一条已经作废，别空等 40 秒
                 err = (getattr(lc, "error", "") or "")
                 no_frame = int(getattr(lc, "frames", 0) or 0) == 0
                 if err and no_frame and any(k in err for k in fatal_keys) \
@@ -654,6 +792,7 @@ class Handler(BaseHTTPRequestHandler):
         # /api/state
         if parts[:2] == ["api", "state"] and method == "GET":
             cfg = C.load()
+            sess = self._user()
             av = _live.status()
             rv = _rec.status()
             import nw_xiaomi as X
@@ -663,24 +802,38 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             cams = []
-            for c in cfg.get("cameras") or []:
+            # 只读账号只看自己被授权的那几路 —— 在这里过滤，页面才不会先闪出
+            # 全部摄像头再逐个报 404（真正的拦截仍然在流/文件出口，见 _cam_ok_or_deny）
+            for c in A.visible_cams(sess, cfg.get("cameras") or []):
                 cid = str(c.get("id"))
                 d = dict(c)
                 d.pop("url_password", None)
                 # 小米走 XiaomiHub，其余走 LiveHub：两边的取流状态合并给前端，
                 # 这样前端能直接显示"设备离线/连不上"的真实原因，而不是干等。
-                live_st = dict(xv.get(cid) or {})
-                live_st.update(av.get(cid) or {})
+                live_st = _redact_secrets(dict(xv.get(cid) or {}))
+                live_st.update(_redact_secrets(dict(av.get(cid) or {})))
                 d["live"] = live_st
-                d["rec"] = rv.get(cid, {})
+                d["rec"] = _redact_secrets(dict(rv.get(cid) or {}))
                 # 「录哪一路」是全局设置，但每路的后果不一样（有的地址本来就不是
                 # *_play），所以按路给出实际会录到什么，让人选之前看得懂。
-                d["rec"]["source_note"] = R.source_note(
-                    c, (cfg.get("storage") or {}).get("source") or "PLAYED")
+                d["rec"]["source_note"] = _mask_url(R.source_note(
+                    c, (cfg.get("storage") or {}).get("source") or "PLAYED"))
                 d["url_masked"] = _mask_url(c.get("url"))
+                # 列表里绝不带明文口令：直播页每次刷新都过这里，带上口令等于把
+                # 摄像头账号挂在浏览器历史与代理日志里。要看原文走
+                # GET /api/cameras/<id>/secret（仅管理员，进审计）。
+                d["url"] = d["url_masked"]
+                if _has_secret(c.get("url")):
+                    d["url_secret"] = True
                 if c.get("url_low"):
                     d["url_low_masked"] = _mask_url(c.get("url_low"))
-                    d["live_low"] = dict(av.get(cid + "#low") or {})
+                    d["url_low"] = d["url_low_masked"]
+                    d["live_low"] = _redact_secrets(dict(av.get(cid + "#low") or {}))
+                # 隐私遮蔽的状态说人话：配了几块、这一路是不是因此必须重编码
+                d["privacy"] = PV.summary(c)
+                d["masked"] = PV.has(c)
+                # 编辑器要拿到具体区域才能画回去（privacy 那两条是给人看的文字）
+                d["masks"] = PV.masks_of(c)
                 cams.append(d)
             # 云台可用性：前端据此决定是否显示方向盘
             ptz_ok, ptz_why = False, "云台模块未加载"
@@ -690,8 +843,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 ptz_why = str(e)
             return self._j({"ok": True, "version": VERSION, "cameras": cams,
+                            "auth": A.public_state(sess),
                             "storage": _rec.usage(),
-                            "settings": _public_settings(cfg),
+                            "settings": _public_settings(cfg, admin=A.is_admin(sess)),
                             "xiaomi": X.get_auth().snapshot(),
                             "ptz": {"available": ptz_ok, "reason": ptz_why},
                             "storage_error": (rv.get("_storage") or {}).get("error", "")})
@@ -699,39 +853,44 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 登录闸门 / 会话 ----
         if parts[:2] == ["api", "auth"] and method == "GET":
             return self._j({"ok": True,
-                            "auth": A.public_state(self._logged_in())})
+                            "auth": A.public_state(self._user())})
 
         if parts[:2] == ["api", "login"] and method == "POST":
             body = self._body()
-            peer = ""
-            try:
-                peer = str((self.client_address or ("",))[0])
-            except Exception:
-                pass
-            token = A.login(body.get("username"), body.get("password"), peer=peer)
+            token = A.login(body.get("username"), body.get("password"),
+                            peer=self._ip())
             if not token:
                 return self._err("用户名或密码不正确（连续失败会临时锁定 15 分钟）", 401)
             return self._send(200, _json_bytes(
-                {"ok": True, "auth": A.public_state(True)}),
+                {"ok": True, "auth": A.public_state(A.current(token))}),
                 extra={"Set-Cookie": A.cookie(token)})
 
         if parts[:2] == ["api", "logout"] and method == "POST":
-            A.logout(A.token_from_headers(self.headers))
+            tok = A.token_from_headers(self.headers)
+            A.logout(tok, peer=self._ip())
             return self._send(200, _json_bytes(
-                {"ok": True, "auth": A.public_state(False)}),
+                {"ok": True, "auth": A.public_state(None)}),
                 extra={"Set-Cookie": A.cookie("", logout=True)})
 
         if parts[:2] == ["api", "password"] and method == "POST":
             # 还没设过密码 = 首次认领，免登录；已设过则必须带原密码
             if A.required() and not self._logged_in():
                 return self._err("需要登录", 401)
+            # 这一条改的始终是**内置管理员**的口令（口令存在 cfg["auth"] 里），
+            # 所以只读账号不该碰它：他的密码由管理员在「用户与授权」里维护。
+            # 不加这道判断的话，任何登录态都能拿"猜中的旧密码"把管理员换掉。
+            if A.configured() and not A.is_admin(self._user()):
+                return self._err("只有管理员能改内置登录密码；"
+                                 "只读账号的密码请让管理员在「用户与授权」里改", 403)
             body = self._body()
             ok, msg = A.set_password(body.get("password"), body.get("old_password"))
             if not ok:
                 return self._err(msg, 400)
-            token = A.login(A.username(), body.get("password"))
+            token = A.login(A.username(), body.get("password"), peer=self._ip())
+            self._audit("password_change")
             return self._send(200, _json_bytes(
-                {"ok": True, "msg": msg, "auth": A.public_state(bool(token))}),
+                {"ok": True, "msg": msg,
+                 "auth": A.public_state(A.current(token) if token else None)}),
                 extra={"Set-Cookie": A.cookie(token)} if token else None)
 
         # ---- 业务链路健康 ----
@@ -798,6 +957,34 @@ class Handler(BaseHTTPRequestHandler):
         if parts[:2] == ["api", "events"]:
             return self._events_api(method, parts, q)
 
+        # ---- 本地 AI：状态与自然语言检索 ----
+        if parts[:2] == ["api", "ai"]:
+            return self._ai_api(method, parts, q)
+
+        # ---- 审计日志："谁看过哪段" ----
+        if parts[:2] == ["api", "audit"]:
+            return self._audit_api(method, parts, q)
+
+        # ---- 录像完整性自检（丢帧/空洞清单）----
+        if parts[:2] == ["api", "integrity"]:
+            return self._integrity_api(method, parts, q)
+
+        # ---- 冷层归档（rclone 上云）----
+        if parts[:2] == ["api", "archive"]:
+            return self._archive_api(method, parts, q)
+
+        # ---- 片段导出 mp4 ----
+        if parts[:2] == ["api", "export"]:
+            return self._export_api(method, parts, q)
+
+        # ---- 带有效期的分享链接 ----
+        if parts[:2] == ["api", "shares"]:
+            return self._shares_api(method, parts, q)
+
+        # ---- 多用户与按摄像头授权 ----
+        if parts[:2] == ["api", "users"]:
+            return self._users_api(method, parts, q)
+
         # ---- 云台 PTZ ----
         if parts[:2] == ["api", "ptz"]:
             return self._ptz_api(method, parts, q)
@@ -831,8 +1018,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if parts[:2] == ["api", "settings"]:
             if method == "GET":
+                # 只读账号不需要看 SMTP 地址、归档远端这些配置项
+                if self._require_admin() is None:
+                    return
                 return self._j({"ok": True, "settings": _public_settings(C.load())})
             if method in ("PUT", "POST"):
+                sess = self._require_admin()
+                if sess is None:
+                    return
                 body = self._body()
                 cfg = C.load()
                 notes = []
@@ -858,8 +1051,18 @@ class Handler(BaseHTTPRequestHandler):
                                                    "ding_secret", "bark_url",
                                                    "webhook_url", "arming_mode",
                                                    "arming_ranges", "digest_enabled",
-                                                   "digest_hour")),
-                                       ("auth", ("enabled", "username", "session_hours"))):
+                                                   "digest_hour", "link_base")),
+                                       ("auth", ("enabled", "username", "session_hours")),
+                                       ("ai", ("enabled", "audio_events",
+                                               "audio_threshold", "objects",
+                                               "model_path", "labels", "input_size",
+                                               "obj_confidence", "vlm_enabled",
+                                               "vlm_url", "vlm_key", "vlm_model")),
+                                       ("archive", ("enabled", "remote", "older_days",
+                                                    "delete_local", "auto",
+                                                    "auto_hour")),
+                                       ("integrity", ("enabled", "days",
+                                                      "gap_tolerance"))):
                     sec = body.get(group)
                     if not isinstance(sec, dict):
                         continue
@@ -869,6 +1072,8 @@ class Handler(BaseHTTPRequestHandler):
                         picked.pop("smtp_pass", None)
                     if group == "notify" and not picked.get("ding_secret"):
                         picked.pop("ding_secret", None)
+                    if group == "ai" and not picked.get("vlm_key"):
+                        picked.pop("vlm_key", None)
                     base = dict(cfg.get(group) or {})
                     cfg[group] = C.normalize(group, picked, base)
                     notes += C.diff_notes(group, picked, cfg[group])
@@ -934,6 +1139,12 @@ class Handler(BaseHTTPRequestHandler):
                     if not cfg["auth"].get("username"):
                         cfg["auth"]["username"] = "admin"
                 C.save(cfg)
+                # 审计记"改了哪几组 + 钳制说明"，不记具体值：设置里有 SMTP 口令、
+                # passToken、VLM key，写进日志等于把秘密抄到另一个文件里
+                self._audit("settings_change",
+                            groups=",".join(sorted(k for k in body
+                                                   if isinstance(body.get(k), dict))),
+                            notes=" | ".join(notes)[:400])
                 if ptz_restart:
                     try:
                         import nw_ptz as _P
@@ -965,6 +1176,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if parts[:2] == ["api", "cameras"]:
             if len(parts) == 2 and method == "POST":
+                if self._require_admin() is None:
+                    return
                 return self._camera_create()
             if len(parts) >= 3:
                 cid = parts[2]
@@ -972,20 +1185,46 @@ class Handler(BaseHTTPRequestHandler):
                 if not cam:
                     return self._err("摄像头不存在", 404)
                 if len(parts) == 3 and method == "PUT":
+                    if self._require_admin() is None:
+                        return
                     return self._camera_update(cam)
                 if len(parts) == 3 and method == "DELETE":
+                    if self._require_admin() is None:
+                        return
                     cfg = C.load()
                     cfg["cameras"] = [c for c in cfg["cameras"] if str(c.get("id")) != str(cid)]
                     C.save(cfg)
                     _live.drop(cid)
+                    self._audit("cam_delete", cam=str(cid),
+                               name=cam.get("name") or "")
+                    try:
+                        _rec.reconcile()
+                    except Exception:
+                        pass
                     return self._j({"ok": True})
                 if len(parts) == 4 and parts[3] == "test":
+                    if self._require_admin() is None:
+                        return
                     ok, info = _ffprobe(cam.get("url") or "", cam.get("transport") or "tcp")
-                    return self._j({"ok": ok, "info": info if ok else None,
-                                    "error": "" if ok else str(info)})
+                    # ffprobe 的报错原话里带着完整地址（含口令），不能直接回给页面
+                    return self._j({"ok": ok,
+                                    "info": _redact_secrets(info) if ok else None,
+                                    "error": "" if ok else _mask_text(info)})
+                if len(parts) == 4 and parts[3] == "secret":
+                    # 列表里只给掩码，但设置页要能核对完整地址（填错一个字符
+                    # 就连不上），所以单独开一条管理员接口，并且记审计。
+                    if self._require_admin() is None:
+                        return
+                    self._audit("cam_secret_reveal", cam=str(cid))
+                    return self._j({"ok": True, "url": cam.get("url") or "",
+                                    "url_low": cam.get("url_low") or ""})
                 if len(parts) == 4 and parts[3] == "snapshot":
+                    if not self._cam_ok_or_deny(cid, "snapshot"):
+                        return
                     return self._snapshot(cam)
                 if len(parts) == 4 and parts[3] == "relive":
+                    if self._require_admin() is None:
+                        return
                     _live.drop(cid)
                     return self._j({"ok": True})
 
@@ -996,6 +1235,8 @@ class Handler(BaseHTTPRequestHandler):
             cam = (q.get("cam") or [""])[0]
             if not cam or not C.get_camera(cam):
                 return self._err("缺少摄像头", 400)
+            if not self._cam_ok_or_deny(cam, "recordings"):
+                return
             return self._j({"ok": True, "days": _rec.days_with_data(cam),
                             "segments": self._segments_for(cam, q)})
 
@@ -1003,6 +1244,8 @@ class Handler(BaseHTTPRequestHandler):
             cam = (q.get("cam") or [""])[0]
             if not cam or not C.get_camera(cam):
                 return self._err("缺少摄像头", 400)
+            if not self._cam_ok_or_deny(cam, "playlist"):
+                return
             try:
                 t0 = int(float((q.get("from") or ["0"])[0]))
                 t1 = int(float((q.get("to") or ["0"])[0]))
@@ -1024,9 +1267,12 @@ class Handler(BaseHTTPRequestHandler):
         """本地事件侦测：时间轴事件块 + 缩略图墙。
 
         GET  /api/events?cam=&date=YYYY-MM-DD   某路某天的事件列表
+        GET  /api/events/latest?since=ts        指定时刻之后的新事件（通知轮询）
         GET  /api/events/status                 扫描器状态（设置页显示）
         POST /api/events/scan                   立即扫一轮（调完不等结果）
         GET  /api/events/thumb/<cam>/th/x.jpg   事件缩略图（文件名不可枚举出内容）
+
+        事件里带缩略图，等于带画面 —— 每一路都要单独过按摄像头授权。
         """
         if method == "GET" and len(parts) == 3 and parts[2] == "status":
             mo = (C.load().get("motion") or {})
@@ -1035,14 +1281,30 @@ class Handler(BaseHTTPRequestHandler):
                             "sensitivity": mo.get("sensitivity", 50),
                             "scanner": EV.status()})
         if method == "POST" and len(parts) == 3 and parts[2] == "scan":
+            if self._require_admin() is None:
+                return
             EV.request_scan()
             return self._j({"ok": True})
         if method == "GET" and len(parts) >= 3 and parts[2] == "thumb":
             return self._event_thumb(parts)
+        if method == "GET" and len(parts) == 3 and parts[2] == "latest":
+            sess = self._user()
+            if sess is None:
+                return self._err("需要登录", 401)
+            try:
+                since = int(float((q.get("since") or ["0"])[0]))
+            except ValueError:
+                since = int(time.time()) - 3600
+            items = AI.latest(C.recordings_root(), since,
+                              cam_ids=[str(x) for x in (sess.get("cams") or [])])
+            return self._j({"ok": True, "events": items,
+                            "now": int(time.time())})
         if method == "GET" and len(parts) == 2:
             cam = (q.get("cam") or [""])[0]
             if not cam or not C.get_camera(cam):
                 return self._err("缺少摄像头", 400)
+            if not self._cam_ok_or_deny(cam, "events"):
+                return
             compact = re.sub(r"[^0-9]", "", (q.get("date") or [""])[0])[:8]
             if len(compact) != 8:
                 return self._err("日期不合法", 400)
@@ -1052,6 +1314,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _event_thumb(self, parts):
         rel = "/".join(parts[3:])
+        if len(parts) < 4 or not self._cam_ok_or_deny(parts[3], "thumb"):
+            return
         if not rel.endswith(".jpg") or ".." in rel.split("/"):
             return self._send(404, b"not found", "text/plain")
         root = os.path.realpath(os.path.join(C.recordings_root(), "events"))
@@ -1073,6 +1337,274 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    # ---------- 本地 AI：状态与自然语言检索 ----------
+    def _ai_api(self, method, parts, q):
+        """/api/ai/status 只看得到"能不能跑、为什么没跑"；检索按授权过滤。
+
+        诚实化：模型没装、依赖缺失、VLM 没配，都由 `AI.status()` 给出原因，
+        页面直接显示 —— 不假装"已开启"。
+        """
+        if len(parts) == 3 and parts[2] == "status" and method == "GET":
+            try:
+                return self._j({"ok": True, "ai": AI.status()})
+            except Exception as e:
+                return self._err("AI 状态读取出错：%s" % e, 500)
+        if len(parts) == 3 and parts[2] == "search" and method in ("GET", "POST"):
+            body = self._body() if method == "POST" else {}
+            text = (body.get("q") or (q.get("q") or [""])[0] or "").strip()
+            if not text:
+                return self._err("请输入检索内容，例如：昨天下午客厅有人", 400)
+            sess = self._user() or {}
+            cam_ids = [str(x) for x in (sess.get("cams") or [])]
+            try:
+                res = AI.search(C.recordings_root(), text, cam_ids=cam_ids)
+            except Exception as e:
+                return self._err("检索失败：%s" % e, 500)
+            self._audit("ai_search", hits=res.get("total", 0), text=text[:60])
+            return self._j(res)
+        return self._err("没有这个 AI 接口：%s" % "/".join(parts), 404)
+
+    # ---------- 审计日志 ----------
+    def _audit_api(self, method, parts, q):
+        """/api/audit —— 只有管理员能看（里面全是"谁在什么时候看了哪儿"）。"""
+        if self._require_admin() is None:
+            return
+        if len(parts) == 3 and parts[2] == "kinds" and method == "GET":
+            return self._j({"ok": True, "kinds": AU.kinds()})
+        if method == "GET":
+            try:
+                days = max(0, min(int((q.get("days") or ["7"])[0]), 90))
+            except ValueError:
+                days = 7
+            try:
+                limit = max(1, min(int((q.get("limit") or ["500"])[0]), 5000))
+            except ValueError:
+                limit = 500
+            rows = AU.read(days=days,
+                           kind=(q.get("kind") or [None])[0],
+                           actor=(q.get("actor") or [None])[0],
+                           limit=limit)
+            return self._j({"ok": True, "rows": rows, "status": AU.status()})
+        return self._err("没有这个审计接口：%s" % "/".join(parts), 404)
+
+    # ---------- 录像完整性自检 ----------
+    def _integrity_api(self, method, parts, q):
+        if len(parts) == 3 and parts[2] == "scan" and method == "POST":
+            if self._require_admin() is None:
+                return
+            body = self._body()
+            cam = str(body.get("cam") or "").strip() or None
+            res = IG.take_snapshot(cams=[cam] if cam else None,
+                                   deep=bool(body.get("deep")))
+            self._audit("integrity_scan", cam=cam or "all", deep=bool(body.get("deep")))
+            return self._j({"ok": True, **res})
+        sess = self._user()
+        if sess is None:
+            return self._err("需要登录", 401)
+        st = IG.status()
+        # 只读账号只看自己那几路的空洞清单
+        if not A.is_admin(sess):
+            allow = {str(x) for x in (sess.get("cams") or [])}
+            res = st.get("result") or {}
+            res = dict(res)
+            res["cams"] = [c for c in (res.get("cams") or [])
+                           if str(c.get("cam")) in allow]
+            res["gaps_total"] = sum(len(c.get("gaps") or []) for c in res["cams"])
+            res["bad_total"] = sum(len(c.get("bad") or []) for c in res["cams"])
+            st = dict(st)
+            st["result"] = res
+        return self._j({"ok": True, "integrity": st})
+
+    # ---------- 冷层归档 ----------
+    def _archive_api(self, method, parts, q):
+        if self._require_admin() is None:
+            return
+        if len(parts) == 3 and parts[2] == "run" and method == "POST":
+            body = self._body()
+            res = AR.run(cam=str(body.get("cam") or "").strip() or None,
+                         older_days=body.get("older_days"))
+            self._audit("archive_run", started=res.get("started"),
+                        error=res.get("error") or "")
+            return self._j({"ok": True, **res})
+        if len(parts) == 3 and parts[2] == "cancel" and method == "POST":
+            self._audit("archive_cancel")
+            return self._j(AR.cancel())
+        return self._j({"ok": True, "archive": AR.status()})
+
+    # ---------- 片段导出 ----------
+    def _export_api(self, method, parts, q):
+        """导出是"把原片拿走"的动作，只给管理员；每次导出与分享都进审计。"""
+        if self._require_admin() is None:
+            return
+        if method == "POST" and len(parts) == 2:
+            body = self._body()
+            job, err = EX.create(body.get("cam"), body.get("from"), body.get("to"),
+                                 mask=bool(body.get("mask", True)),
+                                 note=body.get("note") or "",
+                                 actor=self._actor())
+            if err:
+                return self._err(err, 400)
+            self._audit("export_create", cam=job["cam"], frm=job["from"],
+                        to=job["to"], mask=bool(job["mask"]), job=job["id"])
+            return self._j({"ok": True, "job": EX.public_job(job)})
+        if method == "GET" and len(parts) == 2:
+            return self._j({"ok": True, "jobs": EX.list_jobs()})
+        if len(parts) >= 3:
+            jid = parts[2]
+            if len(parts) == 3 and method == "GET":
+                job = EX.get(jid)
+                if not job:
+                    return self._err("没有这个导出任务（服务重启会丢掉进度）", 404)
+                return self._j({"ok": True, "job": EX.public_job(job)})
+            if len(parts) == 4 and parts[3] == "share" and method == "POST":
+                body = self._body()
+                rec, err = EX.share(jid, hours=body.get("hours", 24),
+                                    actor=self._actor(), ip=self._ip())
+                if err:
+                    return self._err(err, 400)
+                return self._j({"ok": True, "share": _share_row(rec, self)})
+        return self._err("没有这个导出接口：%s" % "/".join(parts), 404)
+
+    # ---------- 分享链接管理 ----------
+    def _shares_api(self, method, parts, q):
+        if self._require_admin() is None:
+            return
+        if method == "DELETE" and len(parts) == 3:
+            tok = urllib.parse.unquote(parts[2])
+            ok, msg = EX.revoke(tok)
+            self._audit("share_revoke", token=tok[:6] + "…", ok=ok)
+            return self._j({"ok": ok, "msg": msg})
+        if method == "GET":
+            return self._j({"ok": True,
+                            "shares": [_share_row(s, self) for s in EX.shares()]})
+        return self._err("没有这个分享接口：%s" % "/".join(parts), 404)
+
+    # ---------- 多用户与按摄像头授权 ----------
+    def _users_api(self, method, parts, q):
+        if self._require_admin() is None:
+            return
+        if method == "GET" and len(parts) == 2:
+            return self._j({"ok": True, "users": A.users()})
+        if method == "POST" and len(parts) == 2:
+            body = self._body()
+            user, err = A.create_user(body.get("name"), body.get("password"),
+                                      role=body.get("role") or "read",
+                                      cams=body.get("cams"))
+            if err:
+                return self._err(err, 400)
+            self._audit("user_create", target=user.get("name"),
+                        role=user.get("role"))
+            return self._j({"ok": True, "user": user})
+        if len(parts) == 3:
+            name = urllib.parse.unquote(parts[2])
+            if method in ("PUT", "POST"):
+                body = self._body()
+                user, err = A.update_user(
+                    name, password=body.get("password") or None,
+                    role=body.get("role"), cams=body.get("cams"),
+                    enabled=body.get("enabled"))
+                if err:
+                    return self._err(err, 400)
+                self._audit("user_update", target=name)
+                return self._j({"ok": True, "user": user})
+            if method == "DELETE":
+                ok, msg = A.delete_user(name)
+                self._audit("user_delete", target=name, ok=ok)
+                return self._j({"ok": ok, "msg": msg})
+        return self._err("没有这个用户接口：%s" % "/".join(parts), 404)
+
+    # ---------- 免登录的分享页 / 导出原片 ----------
+    def _share_route(self, path, head=False):
+        tok = urllib.parse.unquote(path[len("/share/"):]).strip("/")
+        if "/" in tok:
+            # /share/<token>/video.mp4 —— 只发这一路导出文件，不带其它能力
+            tok, _sub = tok.split("/", 1)
+            return self._share_video(tok)
+        rec, why = EX.share_of(tok or "")
+        if why != "ok":
+            msg = {"notfound": "链接不存在或已被撤销",
+                   "expired": "链接已过期",
+                   "gone": "视频文件已被清理"}[why]
+            return self._send(404, _share_error_page(msg).encode("utf-8"),
+                              "text/html; charset=utf-8", head=head)
+        base = _share_base(self, tok)
+        return self._send(200, EX._share_page(rec, base).encode("utf-8"),
+                          "text/html; charset=utf-8", head=head)
+
+    def _share_video(self, tok):
+        rec, why = EX.share_of(tok or "")
+        if why != "ok":
+            return self._send(404, b"not found", "text/plain")
+        self._audit("share_hit", cam=rec.get("cam"), share=tok[:6] + "…")
+        return self._send_video_file(str(rec.get("file") or ""))
+
+    def _export_route(self, path, head=False):
+        """/export/<id>/file.mp4 —— 登录 + 授权以后取导出原片。"""
+        sess = self._user()
+        if sess is None:
+            return self._err("需要登录", 401)
+        parts = [p for p in path.strip("/").split("/") if p]
+        if len(parts) < 3 or parts[2] != "file.mp4":
+            return self._send(404, b"not found", "text/plain")
+        job = EX.get(parts[1])
+        if not job:
+            return self._send(404, b"not found", "text/plain")
+        if not A.cam_ok(sess, job.get("cam")):
+            return self._send(404, b"not found", "text/plain")
+        if job.get("state") != "done":
+            return self._err("导出还没完成（当前 %s%%）" % job.get("pct"), 409)
+        self._audit("export_download", cam=job.get("cam"), job=job.get("id"))
+        # 下载名用中性的任务号，不带摄像头真名（导出件经常要转给别人）
+        return self._send_video_file(str(job.get("file") or ""),
+                                     attach_name="homeeye-%s.mp4" % job.get("id"))
+
+    def _send_video_file(self, full, attach_name=""):
+        """带 Range 的视频文件下发（导出与分享共用），路径必须是绝对且存在的。"""
+        full = os.path.realpath(full or "")
+        allowed = os.path.realpath(EX.exports_dir())
+        if not full.startswith(allowed + os.sep) or not os.path.isfile(full):
+            return self._send(404, b"not found", "text/plain")
+        size = os.path.getsize(full)
+        rng = self.headers.get("Range") or ""
+        start, end, code = 0, size - 1, 200
+        m = re.match(r"bytes=(\d*)-(\d*)", rng.strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                if m.group(2):
+                    end = int(m.group(2))
+            else:
+                start = max(0, size - int(m.group(2)))
+            end = min(end, size - 1)
+            if start > end:
+                return self._send(416, b"", "text/plain",
+                                  extra={"Content-Range": "bytes */%d" % size})
+            code = 206
+        length = end - start + 1
+        self.send_response(code)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        # 导出走下载（attachment），分享页要内嵌播放（inline）
+        cd = ('attachment; filename="%s"' % attach_name) if attach_name else "inline"
+        self.send_header("Content-Disposition", cd)
+        if code == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        try:
+            with open(full, "rb") as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    chunk = f.read(min(262144, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def _onvif_api(self, method, parts):
         """ONVIF 设备发现。
 
@@ -1084,6 +1616,9 @@ class Handler(BaseHTTPRequestHandler):
             import nw_onvif as O
         except Exception as e:
             return self._err("ONVIF 模块不可用：%s" % e, 500)
+        # 扫描与探测都要带设备账号，且是在"添加摄像头"这条路上 —— 只给管理员
+        if self._require_admin() is None:
+            return
 
         if len(parts) == 3 and parts[2] == "scan" and method == "POST":
             try:
@@ -1141,6 +1676,12 @@ class Handler(BaseHTTPRequestHandler):
             cam = str(body.get("cam") or "")
             if not cam:
                 return self._err("缺少 cam", 400)
+            # 转动摄像头是"改变物理世界"的动作：只读账号既不能转别人的头，
+            # 也不能转没授权给它的那一路
+            if self._require_admin() is None:
+                return
+            if not self._cam_ok_or_deny(cam, "ptz_move"):
+                return
             try:
                 op = int(body.get("op"))
             except (TypeError, ValueError):
@@ -1190,6 +1731,20 @@ class Handler(BaseHTTPRequestHandler):
     def _talk_api(self, method, parts, q):
         """对讲（上行语音）。音频是裸 PCM，body 直接当二进制读，不走 JSON。"""
         import nw_ptz as P
+
+        # 对着摄像头喇叭喊话会真的在家里出声，只给管理员，而且要看它有没有
+        # 这一路的授权。push 的 body 是裸 PCM，绝不能按 JSON 读（会把 rfile
+        # 吃掉，后面 _raw_body 就什么都读不到了），所以它的 cam 只从 query 取。
+        key = parts[2] if len(parts) == 3 else ""
+        cam = ""
+        if key == "push":
+            cam = (q.get("cam") or [""])[0]
+        elif key in ("start", "stop", "beep"):
+            cam = str(self._body().get("cam") or "")
+        if self._require_admin() is None:
+            return
+        if key and cam and not self._cam_ok_or_deny(cam, "talk"):
+            return
 
         # POST /api/talk/start  {"cam": "c2"} -> 打开摄像头喇叭通道
         if len(parts) == 3 and parts[2] == "start" and method == "POST":
@@ -1250,6 +1805,11 @@ class Handler(BaseHTTPRequestHandler):
     def _xiaomi_api(self, method, parts, q):
         import nw_xiaomi as X
         auth = X.get_auth()
+        # 扫码授权、重置授权、列设备都在动米家账号，只给管理员；
+        # status/available 只是"这台机器认没授权"，只读账号的状态页要看
+        if method == "POST" or (len(parts) == 3 and parts[2] == "devices"):
+            if self._require_admin() is None:
+                return
         # /api/xiaomi/status -> 授权状态
         if len(parts) == 3 and parts[2] == "status":
             return self._j({"ok": True, **auth.snapshot()})
@@ -1310,7 +1870,8 @@ class Handler(BaseHTTPRequestHandler):
         fresh = (q.get("fresh") or ["0"])[0] in ("1", "true", "yes")
         if method == "GET":
             want = (q.get("cam") or [""])[0]
-            cams = C.load().get("cameras") or []
+            sess = self._user() or {}
+            cams = A.visible_cams(sess, C.load().get("cameras") or [])
             cams = [c for c in cams if c.get("enabled", True)]
             if want:
                 cams = [c for c in cams if str(c.get("id")) == want]
@@ -1389,10 +1950,16 @@ class Handler(BaseHTTPRequestHandler):
                 "record": bool(body.get("record", True)),
                 "note": (body.get("note") or "")[:200],
             }
+            # 小米这一路也支持遮蔽：遮蔽烧进 P2P 解码后重编码的画面，
+            # 与 RTSP 走的是同一套 ffmpeg drawbox 滤镜
+            xm_masks = PV.sanitize((body.get("privacy") or {}).get("masks"))
+            if xm_masks:
+                cam["privacy"] = {"masks": xm_masks}
             cfg["cameras"].append(cam)
             C.save(cfg)
             _rec.reconcile()
-            return self._j({"ok": True, "camera": cam})
+            self._audit("cam_create", cam=cam["id"], name=cam["name"], type="xiaomi")
+            return self._j({"ok": True, "camera": _pub_cam(cam)})
 
         url = (body.get("url") or "").strip()
         if not url:
@@ -1423,17 +1990,30 @@ class Handler(BaseHTTPRequestHandler):
         low = (body.get("url_low") or "").strip()
         if low:
             cam["url_low"] = low[:400]
+        masks = PV.sanitize((body.get("privacy") or {}).get("masks"))
+        if masks:
+            cam["privacy"] = {"masks": masks}
         if ctype == "onvif":
             cam["onvif_host"] = (body.get("onvif_host") or "").strip()
             cam["onvif_port"] = int(body.get("onvif_port") or 80)
         cfg["cameras"].append(cam)
         C.save(cfg)
         _rec.reconcile()
-        return self._j({"ok": True, "camera": cam})
+        self._audit("cam_create", cam=cam["id"], name=cam["name"], type=cam["type"])
+        return self._j({"ok": True, "camera": _pub_cam(cam)})
 
     def _camera_update(self, cam):
         body = self._body()
         cfg = C.load()
+        masks = None
+        if "privacy" in body:
+            masks = PV.sanitize((body.get("privacy") or {}).get("masks"))
+        old = C.get_camera(cam.get("id")) or {}
+        for k in ("url", "url_low"):
+            # 表单回显的是掩码地址，用户没重填口令时把原口令贴回去：
+            # 不然"改个名字"就会把 rtsp://user:***@host 真写进配置。
+            if k in body and isinstance(body[k], str) and body[k].strip():
+                body[k] = _merge_url_secret(body[k].strip(), old.get(k) or "")
         for c in cfg["cameras"]:
             if str(c.get("id")) != str(cam.get("id")):
                 continue
@@ -1443,10 +2023,83 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("enabled", "record"):
                 if k in body:
                     c[k] = bool(body[k])
+            # 隐私遮蔽：sanitize 过的归一化区域才落盘。改了就重建这一路的直播与
+            # 录像 —— 遮蔽是烧进像素的，不重起 ffmpeg 就还是旧画面。
+            if masks is not None:
+                c["privacy"] = {"masks": masks}
+            if "quality" in body and c.get("type") == "xiaomi":
+                c["quality"] = str(body.get("quality") or "HIGH").upper()
         C.save(cfg)
         _live.drop(cam.get("id"))
-        _rec.reconcile()
-        return self._j({"ok": True, "camera": C.get_camera(cam.get("id"))})
+        try:
+            import nw_xiaomi as X
+            X.get_hub().drop(str(cam.get("id")))
+        except Exception:
+            pass
+        try:
+            _rec.reconcile()
+        except Exception:
+            pass
+        if masks is not None:
+            self._audit("privacy_update", cam=str(cam.get("id")), masks=len(masks))
+        return self._j({"ok": True, "camera": _pub_cam(C.get_camera(cam.get("id")))})
+
+
+def _share_base(handler, token):
+    """分享页里 <video> 的绝对路径前缀（网关模式要带 /app/homeeye）。"""
+    pre = ""
+    raw = str(getattr(handler, "path", "") or "")
+    for cand in ("/app/" + C.APPNAME, "/" + C.APPNAME):
+        if raw.startswith(cand + "/share/"):
+            pre = cand
+            break
+    return "%s/share/%s" % (pre, urllib.parse.quote(str(token), safe=""))
+
+
+def _share_row(rec, handler):
+    """分享记录 + 一条能直接点开的完整 URL。
+
+    主机名从 Host 头取：容器里监听 0.0.0.0，本机根本不知道别人是从哪个
+    地址访问进来的，写死 127.0.0.1 发出去的链接在别人手里全是打不开的。
+    """
+    row = dict(rec or {})
+    host = str(handler.headers.get("Host") or "").strip()
+    if not host:
+        try:
+            cfg = C.load()
+            host = (cfg.get("notify") or {}).get("link_base") or ""
+            host = re.sub(r"^https?://", "", str(host)).rstrip("/")
+        except Exception:
+            host = ""
+    scheme = _scheme(handler)
+    token = str(row.get("token") or "")
+    row["url"] = ("%s://%s/share/%s" % (scheme, host, token)) if host else ""
+    return row
+
+
+def _scheme(handler):
+    """当前请求走的是 http 还是 https（分享链接必须是绝对地址）。"""
+    fwd = str(handler.headers.get("X-Forwarded-Proto") or "").strip().lower()
+    if fwd in ("http", "https"):
+        return fwd
+    try:
+        import ssl as _ssl
+        if isinstance(getattr(handler, "connection", None), _ssl.SSLSocket):
+            return "https"
+    except Exception:
+        pass
+    return "http"
+
+
+def _share_error_page(msg):
+    return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>HomeEye · 链接不可用</title>'
+            '<body style="margin:0;background:#0b0f14;color:#dfe7ef;'
+            'font:15px/1.7 system-ui;display:flex;align-items:center;'
+            'justify-content:center;min-height:100vh">'
+            '<div style="text-align:center"><b>这个链接已经不能用了</b><br>'
+            '<span style="color:#93a6bd">%s</span></div></body></html>' % msg)
 
 
 def _mask_url(url):
@@ -1457,9 +2110,102 @@ def _mask_url(url):
     return u
 
 
-def _public_settings(cfg):
+def _has_secret(url):
+    """地址里是否带口令段（scheme://user:pass@host）。"""
+    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#@]*:[^/?#@]*@", url or ""))
+
+
+def _pub_cam(cam):
+    """给前端的摄像头：地址一律掩码，口令只在 reveal 接口里按需取。"""
+    d = _redact_secrets(dict(cam or {}))
+    if d.get("url"):
+        d["url"] = _mask_url(d["url"])
+        d["url_masked"] = d["url"]
+    if d.get("url_low"):
+        d["url_low"] = _mask_url(d["url_low"])
+        d["url_low_masked"] = d["url_low"]
+    d.pop("url_password", None)
+    return d
+
+
+def _mask_text(text):
+    """自由文本（ffmpeg/ffprobe 的报错原话）里的口令也一并抹掉。"""
+    s = str(text or "")
+    if "://" not in s:
+        return s
+    return re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:)[^@\s]+@", r"\1***@",
+                  _mask_url(s))
+
+
+def _redact_secrets(obj, depth=0):
+    """把状态字典里的流地址口令抹掉（就地返回新结构）。
+
+    取流/录像的 error 常常是 ffmpeg 原话，里面就带着 rtsp://user:pass@host ——
+    前端一显示，口令就进了浏览器。地址类字段与自由文本都过一遍。
+    """
+    if depth > 4:
+        return obj
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, str):
+                lk = str(k).lower()
+                if ("url" in lk or "addr" in lk or "source" in lk or lk in
+                        ("error", "reason", "detail", "note", "message", "last")):
+                    v = _mask_text(v)
+
+            elif isinstance(v, (dict, list)):
+                v = _redact_secrets(v, depth + 1)
+            out[k] = v
+        return out
+    if isinstance(obj, list):
+        return [_redact_secrets(x, depth + 1) for x in obj]
+    return obj
+
+
+def _merge_url_secret(new, old):
+    """表单里回显的是掩码地址，用户没重填口令时要把原口令贴回去。
+
+    否则"改个名字"都会把 rtsp://viewer:***@192.168.1.9 真写进配置 —— 摄像头
+    当场取不到流，而用户根本没动过地址。只有新值仍是掩码形态才合并。
+    """
+    if not new or not old or "***@" not in new:
+        return new
+    if not _has_secret(old):
+        return new
+    mn = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@]*@", new)
+    mo = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@]*@", old)
+    if not mn or not mo:
+        return new
+    return mo.group(0) + new[len(mn.group(0)):]
+
+
+def _public_settings(cfg, admin=True):
+    """配置回显。`admin=False` 时只给播放必需的那几项。
+
+    设置里全是地址、账号与远端路径（SMTP 用户名、rclone remote、VLM 网关），
+    只读的家庭账号不需要这些才能看画面 —— 少给就是少泄。
+    """
     st = dict(cfg.get("storage") or {})
     st["effective_dir"] = C.recordings_root(cfg)
+    live = dict(cfg.get("live") or {})
+    if not admin:
+        return {
+            "storage": {},
+            "storage_status": {},
+            "meta": {},
+            "live": {k: live.get(k) for k in ("autoplay", "default_quality", "audio")},
+            "motion": {},
+            "notify": {},
+            "ptz": {},
+            "watchdog": {},
+            "ai": {},
+            "archive": {},
+            "integrity": {},
+            "users": [],
+            "auth": {"enabled": bool((cfg.get("auth") or {}).get("enabled", True)),
+                     "username": "", "configured": True, "session_hours": 24},
+        }
     nt = dict(cfg.get("notify") or {})
     # 密码不回显：只告诉前端「已设置」，避免明文出现在 /api/state 里
     if nt.get("smtp_pass"):
@@ -1477,6 +2223,11 @@ def _public_settings(cfg):
         pz["g2r_pass_set"] = True
         pz["g2r_pass"] = ""
     au = dict(cfg.get("auth") or {})
+    ai = dict(cfg.get("ai") or {})
+    # VLM 的 key 等价于第三方账号的口令，只回「已设置」
+    if ai.get("vlm_key"):
+        ai["vlm_key_set"] = True
+        ai["vlm_key"] = ""
     # 盐与派生值都是敏感物（拿到它能离线跑字典），一个都不回显
     try:
         storage_status = H.storage_state()
@@ -1492,6 +2243,10 @@ def _public_settings(cfg):
         "notify": nt,
         "ptz": pz,
         "watchdog": dict(cfg.get("watchdog") or {}),
+        "ai": ai,
+        "archive": dict(cfg.get("archive") or {}),
+        "integrity": dict(cfg.get("integrity") or {}),
+        "users": A.users(),
         "auth": {"enabled": bool(au.get("enabled", True)),
                  "username": au.get("username") or "admin",
                  "configured": bool(au.get("pw_hash") and au.get("salt")),
@@ -1515,6 +2270,22 @@ else:
     GatewayUnixHTTPServer = None
 
 
+def _start_side_loops():
+    """辅助循环统一在这里拉起（都自带"只起一次"）。
+
+    完整性自检与归档定时都是"没人点也要跑"的运维动作：空洞越早发现越有用，
+    冷层搬运放在低峰自己跑，不需要人每天去点一次按钮。
+    """
+    try:
+        IG.start()
+    except Exception:
+        pass
+    try:
+        AR.start_auto()
+    except Exception:
+        pass
+
+
 def build_server(port, host="127.0.0.1"):
     global _live, _rec
     C.ensure_dirs()
@@ -1529,6 +2300,7 @@ def build_server(port, host="127.0.0.1"):
         pass
     H.start()
     W.start()
+    _start_side_loops()
     httpd = ThreadingHTTPServer((host, int(port)), Handler)
     httpd.daemon_threads = True
     return httpd
@@ -1551,6 +2323,7 @@ def _ensure_core():
         pass
     H.start()
     W.start()
+    _start_side_loops()
 
 
 def ensure_selfsigned(certdir):
